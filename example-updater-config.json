@@ -1,0 +1,4 @@
+{
+  "binaryPath": "/custom/path/to/sentinel",
+  "enableAutoDetection": true
+}

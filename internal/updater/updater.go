@@ -52,6 +52,7 @@ func Run() {
 		currentVersion, err := getInstalledVersion()
 		if err != nil {
 			LogError("Failed to get installed version: %v", err)
+			LogInfo("This is a transient error - detection will be retried automatically")
 			LogInfo("Will retry in %v", CheckInterval)
 			time.Sleep(CheckInterval)
 			continue
@@ -90,10 +91,25 @@ func Run() {
 
 // getInstalledVersion reads the current main agent version
 func getInstalledVersion() (string, error) {
-	binaryPath := paths.GetMainAgentBinaryPath()
+	// Use retry-enabled detection with detailed logging
+	binaryPath, detectionMethod, err := getMainAgentBinaryPathWithDetails()
+	if err != nil {
+		// Log detailed error but allow retry on next check
+		LogError("Failed to detect binary path: %v", err)
+		LogWarning("Will retry detection on next update check")
+		LogInfo("Detection will be retried in %v", CheckInterval)
+		return "", fmt.Errorf("binary path detection failed: %w", err)
+	}
 
-	// Check if binary exists
+	// Log successful detection with method used
+	LogInfo("Binary path successfully detected using method: %s", detectionMethod)
+	LogInfo("Using binary at: %s", binaryPath)
+
+	// Check if binary exists (additional validation)
 	if _, err := os.Stat(binaryPath); os.IsNotExist(err) {
+		LogError("Binary not found at detected path: %s", binaryPath)
+		LogWarning("Invalidating cache and will retry on next check")
+		paths.InvalidateBinaryPathCache()
 		return "", fmt.Errorf("main agent binary not found at %s", binaryPath)
 	}
 
@@ -101,15 +117,133 @@ func getInstalledVersion() (string, error) {
 	cmd := exec.Command(binaryPath, "--version")
 	output, err := cmd.Output()
 	if err != nil {
+		// If version check fails, it might be a corrupted binary
+		LogError("Failed to get version from binary at %s: %v", binaryPath, err)
+		LogWarning("Binary may be corrupted or incompatible")
+		LogWarning("Invalidating cache to force re-detection on next check")
+		paths.InvalidateBinaryPathCache()
 		return "", fmt.Errorf("failed to get version from binary: %w", err)
 	}
 
 	version := strings.TrimSpace(string(output))
 	if version == "" {
+		LogError("Binary at %s returned empty version", binaryPath)
+		LogWarning("This may indicate an incompatible or corrupted binary")
 		return "", fmt.Errorf("binary returned empty version")
 	}
 
 	return version, nil
+}
+
+// getMainAgentBinaryPathWithDetails wraps the path detection and returns the detection method used
+func getMainAgentBinaryPathWithDetails() (path string, method string, err error) {
+	// Get the detector instance to access detection details
+	detector := paths.GetDetector()
+
+	// Attempt detection
+	detectedPath, detectionErr := detector.DetectBinaryPath()
+	if detectionErr != nil {
+		return "", "", detectionErr
+	}
+
+	// Determine which method was used by checking the detector's last successful method
+	// Since we don't have direct access to the method, we'll infer it from the detection process
+	method = inferDetectionMethod(detectedPath)
+
+	return detectedPath, method, nil
+}
+
+// inferDetectionMethod attempts to determine which detection method was used
+func inferDetectionMethod(detectedPath string) string {
+	// Check if path matches common patterns to infer the detection method
+
+	// Check if it's from a manual config
+	configPath := filepath.Join(paths.GetDataDirectory(), "updater-config.json")
+	if _, err := os.Stat(configPath); err == nil {
+		return "manual_configuration"
+	}
+
+	// Check if it's in PATH
+	pathEnv := os.Getenv("PATH")
+	if pathEnv != "" {
+		separator := ":"
+		if runtime.GOOS == "windows" {
+			separator = ";"
+		}
+		pathDirs := strings.Split(pathEnv, separator)
+		detectedDir := filepath.Dir(detectedPath)
+		for _, dir := range pathDirs {
+			if dir == detectedDir {
+				return "path_environment_variable"
+			}
+		}
+	}
+
+	// Check if it's in common paths
+	commonPaths := getCommonInstallationPaths()
+	for _, commonPath := range commonPaths {
+		if detectedPath == commonPath {
+			return "common_installation_directory"
+		}
+	}
+
+	// Check if it's likely from service config (platform-specific paths)
+	switch runtime.GOOS {
+	case "linux":
+		if strings.Contains(detectedPath, "/systemd/") || strings.Contains(detectedPath, "/lib/") {
+			return "systemd_service_configuration"
+		}
+	case "darwin":
+		if strings.Contains(detectedPath, "/Library/") || strings.Contains(detectedPath, "/LaunchDaemons/") {
+			return "launchd_service_configuration"
+		}
+	case "windows":
+		if strings.Contains(detectedPath, "Program Files") || strings.Contains(detectedPath, "ProgramData") {
+			return "windows_service_configuration"
+		}
+	}
+
+	// Default to "auto_detection" if we can't determine the specific method
+	return "auto_detection"
+}
+
+// getCommonInstallationPaths returns platform-specific common installation paths
+func getCommonInstallationPaths() []string {
+	binaryName := "sentinel"
+	if runtime.GOOS == "windows" {
+		binaryName = "sentinel.exe"
+	}
+
+	switch runtime.GOOS {
+	case "linux":
+		return []string{
+			"/usr/local/bin/" + binaryName,
+			"/usr/bin/" + binaryName,
+			"/opt/sentinelgo/" + binaryName,
+			filepath.Join(os.Getenv("HOME"), "go/bin", binaryName),
+			filepath.Join(os.Getenv("HOME"), ".local/bin", binaryName),
+		}
+	case "darwin":
+		return []string{
+			"/usr/local/bin/" + binaryName,
+			"/usr/bin/" + binaryName,
+			"/opt/sentinelgo/" + binaryName,
+			filepath.Join(os.Getenv("HOME"), "go/bin", binaryName),
+			"/Applications/SentinelGo/" + binaryName,
+		}
+	case "windows":
+		return []string{
+			filepath.Join(os.Getenv("ProgramFiles"), "SentinelGo", binaryName),
+			filepath.Join(os.Getenv("ProgramFiles(x86)"), "SentinelGo", binaryName),
+			filepath.Join(os.Getenv("USERPROFILE"), "go", "bin", binaryName),
+			"C:\\SentinelGo\\" + binaryName,
+		}
+	default:
+		return []string{
+			"/usr/local/bin/" + binaryName,
+			"/usr/bin/" + binaryName,
+		}
+	}
 }
 
 // getLatestVersion queries the Go module system for the latest version
@@ -190,7 +324,15 @@ func performUpdate(targetVersion string) error {
 	currentVersion, err := getInstalledVersion()
 	if err != nil {
 		LogWarning("Could not get current version: %v", err)
+		LogWarning("This may indicate the binary is not properly installed")
 		currentVersion = "unknown"
+
+		// If we can't even detect the current binary, we should not proceed with update
+		if currentVersion == "unknown" {
+			LogError("Cannot proceed with update - current binary not detected")
+			LogError("Please ensure sentinel is properly installed before updating")
+			return fmt.Errorf("cannot update: current binary not detected: %w", err)
+		}
 	}
 
 	// Create backup before any changes
@@ -251,9 +393,25 @@ func performUpdate(targetVersion string) error {
 		}
 		LogInfo("Binary installed successfully")
 
+		// Invalidate binary path cache since we just installed a new binary
+		LogInfo("Invalidating binary path cache after installation")
+		paths.InvalidateBinaryPathCache()
+
 		// Step 6: Reinstall service
 		LogInfo("Step 6: Reinstalling main agent service...")
-		installedBinaryPath := paths.GetMainAgentBinaryPath()
+
+		// Re-detect the binary path after installation
+		installedBinaryPath, detectionMethod, detectErr := getMainAgentBinaryPathWithDetails()
+		if detectErr != nil {
+			LogError("Failed to detect newly installed binary: %v", detectErr)
+			// Fall back to non-retry method as a last resort
+			installedBinaryPath = paths.GetMainAgentBinaryPath()
+			LogWarning("Using fallback path detection: %s", installedBinaryPath)
+		} else {
+			LogInfo("Newly installed binary detected using method: %s", detectionMethod)
+			LogInfo("Binary path: %s", installedBinaryPath)
+		}
+
 		if err := serviceManager.Install(MainAgentServiceName, installedBinaryPath); err != nil {
 			return fmt.Errorf("failed to install service: %w", err)
 		}

@@ -1,9 +1,16 @@
 package paths
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
+)
+
+var (
+	detectorInstance     *BinaryDetector
+	detectorInstanceOnce sync.Once
 )
 
 // GetDataDirectory returns the platform-specific data directory
@@ -58,8 +65,54 @@ func GetBinaryDirectory() string {
 }
 
 // GetMainAgentBinaryPath returns the full path to the main agent binary
-// with platform-specific binary names (sentinel on Unix, sentinel.exe on Windows)
+// using dynamic detection with fallback to hardcoded paths
 func GetMainAgentBinaryPath() string {
+	// Initialize detector singleton
+	detectorInstanceOnce.Do(func() {
+		detectorInstance = GetDetector()
+	})
+
+	// Try dynamic detection
+	path, err := detectorInstance.DetectBinaryPath()
+	if err != nil {
+		fmt.Printf("[WARN] Dynamic binary detection failed: %v\n", err)
+		fmt.Println("[WARN] Falling back to hardcoded path")
+		return getFallbackBinaryPath()
+	}
+
+	fmt.Printf("[INFO] Using dynamically detected binary path: %s\n", path)
+	return path
+}
+
+// GetMainAgentBinaryPathWithRetry attempts to detect the binary path with retry logic
+// This should be used by the updater to ensure transient failures are handled
+func GetMainAgentBinaryPathWithRetry() (string, error) {
+	// Initialize detector singleton
+	detectorInstanceOnce.Do(func() {
+		detectorInstance = GetDetector()
+	})
+
+	// Try dynamic detection
+	path, err := detectorInstance.DetectBinaryPath()
+	if err != nil {
+		// Return error to caller so they can decide whether to retry
+		return "", fmt.Errorf("binary path detection failed: %w", err)
+	}
+
+	return path, nil
+}
+
+// InvalidateBinaryPathCache forces re-detection of the binary path on next call
+// This should be called when an update operation fails due to invalid path
+func InvalidateBinaryPathCache() {
+	if detectorInstance != nil {
+		fmt.Println("[INFO] Invalidating binary path cache")
+		detectorInstance.invalidateCache()
+	}
+}
+
+// getFallbackBinaryPath returns the hardcoded fallback path for backward compatibility
+func getFallbackBinaryPath() string {
 	binaryName := "sentinel"
 	if runtime.GOOS == "windows" {
 		binaryName = "sentinel.exe"
