@@ -132,6 +132,18 @@ func getInstalledVersion() (string, error) {
 		return "", fmt.Errorf("binary returned empty version")
 	}
 
+	// Extract just the version number from output like "SentinelGo v1.6.116"
+	// The binary may return various formats, so we need to extract the version
+	versionParts := strings.Fields(version)
+	for _, part := range versionParts {
+		// Look for a part that starts with 'v' followed by a digit
+		if len(part) > 1 && part[0] == 'v' && part[1] >= '0' && part[1] <= '9' {
+			return part, nil
+		}
+	}
+
+	// If no version pattern found, return the full output
+	LogWarning("Could not extract version number from output: %s", version)
 	return version, nil
 }
 
