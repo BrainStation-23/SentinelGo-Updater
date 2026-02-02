@@ -714,32 +714,38 @@ func cleanupOldFiles() error {
 func downloadAndCompile(version string) (string, error) {
 	LogInfo("Setting up Go environment for compilation...")
 
-	// On Windows, ensure GCC is available before proceeding
+	// On Windows, find and add GCC to PATH
 	if runtime.GOOS == "windows" {
 		LogInfo("Windows platform detected")
 		LogInfo("CGO compilation requires GCC (C compiler) on Windows")
-		LogInfo("Checking GCC availability before proceeding with compilation...")
-		LogInfo("")
 
-		if err := ensureGCCAvailable(); err != nil {
-			LogError("Failed to ensure GCC availability")
-			LogError("Error: %v", err)
+		// Try to find GCC
+		gccBinPath := findGCCPath()
+
+		if gccBinPath == "" {
+			LogError("GCC not found on system")
 			LogError("")
-			LogError("COMPILATION CANNOT PROCEED:")
-			LogError("  CGO-enabled Go code requires a C compiler (GCC)")
-			LogError("  The update process cannot continue without GCC")
+			LogError("INSTALLATION REQUIRED:")
+			LogError("  Please install GCC using winget:")
+			LogError("  winget install BrechtSanders.WinLibs.POSIX.UCRT")
 			LogError("")
-			LogError("NEXT STEPS:")
-			LogError("  1. Review the error messages above for specific failure reasons")
-			LogError("  2. Follow the recovery instructions provided")
-			LogError("  3. Retry the update after resolving GCC availability")
+			LogError("  After installation, restart the updater service and retry the update")
 			LogError("")
-			LogError("The update will now be rolled back to preserve system stability")
-			// Return a wrapped error with a specific marker for GCC installation failure
-			return "", fmt.Errorf("GCC_INSTALLATION_FAILED: %w", err)
+			return "", fmt.Errorf("GCC not found - please install using: winget install BrechtSanders.WinLibs.POSIX.UCRT")
 		}
 
-		LogInfo("GCC availability confirmed - proceeding with compilation")
+		// Add to PATH for this process
+		currentPath := os.Getenv("PATH")
+		if !strings.Contains(currentPath, gccBinPath) {
+			newPath := gccBinPath + string(os.PathListSeparator) + currentPath
+			if err := os.Setenv("PATH", newPath); err != nil {
+				LogError("Failed to add GCC to PATH: %v", err)
+				return "", fmt.Errorf("failed to add GCC to PATH: %w", err)
+			}
+			LogInfo("Added GCC to PATH: %s", gccBinPath)
+		}
+
+		LogInfo("GCC is ready for compilation")
 		LogInfo("")
 	}
 
@@ -858,6 +864,100 @@ func checkGCCInPath() bool {
 	LogInfo("GCC not found in PATH")
 	LogInfo("GCC detection error: %v", err)
 	return false
+}
+
+// findGCCPath finds GCC installation on Windows by searching filesystem
+func findGCCPath() string {
+	// Method 1: Check if gcc is already accessible in PATH
+	if checkGCCInPath() {
+		LogInfo("GCC found in environment PATH")
+		return "" // Already in PATH, no need to add
+	}
+
+	// Method 2: Search filesystem for gcc.exe
+	LogInfo("Searching for gcc.exe in filesystem...")
+
+	// Search in WinGet packages directory (per-user installations)
+	usersDir := "C:\\Users"
+	users, err := os.ReadDir(usersDir)
+	if err != nil {
+		LogWarning("Failed to read Users directory: %v", err)
+	} else {
+		// Search in each user's WinGet packages directory
+		for _, user := range users {
+			if !user.IsDir() {
+				continue
+			}
+			username := user.Name()
+			wingetPath := filepath.Join(usersDir, username, "AppData", "Local", "Microsoft", "WinGet", "Packages")
+
+			LogInfo("Checking WinGet packages for user: %s", username)
+
+			if _, err := os.Stat(wingetPath); err != nil {
+				continue // WinGet directory doesn't exist for this user
+			}
+
+			// Search for WinLibs package
+			packages, err := os.ReadDir(wingetPath)
+			if err != nil {
+				continue
+			}
+
+			for _, pkg := range packages {
+				if !pkg.IsDir() {
+					continue
+				}
+
+				// Check if this is a WinLibs package
+				if strings.Contains(pkg.Name(), "WinLibs") || strings.Contains(pkg.Name(), "mingw") {
+					pkgPath := filepath.Join(wingetPath, pkg.Name())
+
+					// Check common bin locations
+					binPaths := []string{
+						filepath.Join(pkgPath, "mingw64", "bin"),
+						filepath.Join(pkgPath, "mingw32", "bin"),
+						filepath.Join(pkgPath, "bin"),
+					}
+
+					for _, binPath := range binPaths {
+						gccExe := filepath.Join(binPath, "gcc.exe")
+						if _, err := os.Stat(gccExe); err == nil {
+							LogInfo("Found gcc.exe at: %s", binPath)
+							return binPath
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Also check Program Files (system-wide installations)
+	programFilesPaths := []string{
+		"C:\\Program Files\\WinLibs",
+		"C:\\Program Files\\mingw64",
+		"C:\\Program Files (x86)\\WinLibs",
+		"C:\\Program Files (x86)\\mingw64",
+	}
+
+	for _, base := range programFilesPaths {
+		binPath := filepath.Join(base, "bin")
+		gccExe := filepath.Join(binPath, "gcc.exe")
+		if _, err := os.Stat(gccExe); err == nil {
+			LogInfo("Found gcc.exe at: %s", binPath)
+			return binPath
+		}
+
+		// Also check mingw64/bin subdirectory
+		binPath = filepath.Join(base, "mingw64", "bin")
+		gccExe = filepath.Join(binPath, "gcc.exe")
+		if _, err := os.Stat(gccExe); err == nil {
+			LogInfo("Found gcc.exe at: %s", binPath)
+			return binPath
+		}
+	}
+
+	LogWarning("gcc.exe not found in any location")
+	return ""
 }
 
 // checkGCCInCommonLocations searches for GCC in standard installation directories
