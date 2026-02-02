@@ -18,7 +18,12 @@ func (m *windowsManager) Stop(serviceName string) error {
 	cmd := exec.Command("sc.exe", "stop", serviceName)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("failed to stop service %s: %w, output: %s", serviceName, err, string(output))
+		outputStr := string(output)
+		// If service doesn't exist, that's okay - it's already "stopped"
+		if strings.Contains(outputStr, "1060") || strings.Contains(outputStr, "does not exist") {
+			return nil
+		}
+		return fmt.Errorf("failed to stop service %s: %w, output: %s", serviceName, err, outputStr)
 	}
 	return nil
 }
@@ -28,7 +33,12 @@ func (m *windowsManager) Uninstall(serviceName string) error {
 	cmd := exec.Command("sc.exe", "delete", serviceName)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("failed to delete service %s: %w, output: %s", serviceName, err, string(output))
+		outputStr := string(output)
+		// If service doesn't exist, that's okay - it's already uninstalled
+		if strings.Contains(outputStr, "1060") || strings.Contains(outputStr, "does not exist") {
+			return nil
+		}
+		return fmt.Errorf("failed to delete service %s: %w, output: %s", serviceName, err, outputStr)
 	}
 	return nil
 }
@@ -39,11 +49,12 @@ func (m *windowsManager) Install(serviceName, binaryPath string) error {
 	systemPath := getSystemPATH()
 
 	// Create the service with sc.exe
-	// sc.exe create <serviceName> binPath= "<binaryPath>" start= auto
+	// sc.exe create <serviceName> binPath="<binaryPath>" start=auto
+	// NOTE: No space after the equals sign - sc.exe is strict about syntax
 	cmd := exec.Command("sc.exe", "create", serviceName,
-		fmt.Sprintf("binPath= \"%s\"", binaryPath),
-		"start= auto",
-		"DisplayName= SentinelGo Agent",
+		fmt.Sprintf("binPath=\"%s\"", binaryPath),
+		"start=auto",
+		"DisplayName=SentinelGo Agent",
 	)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -72,8 +83,8 @@ func (m *windowsManager) Install(serviceName, binaryPath string) error {
 
 	// Configure service to restart on failure
 	cmd = exec.Command("sc.exe", "failure", serviceName,
-		"reset= 86400",
-		"actions= restart/60000/restart/60000/restart/60000",
+		"reset=86400",
+		"actions=restart/60000/restart/60000/restart/60000",
 	)
 	if err := cmd.Run(); err != nil {
 		// Log warning but don't fail installation
