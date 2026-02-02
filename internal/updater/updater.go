@@ -1,13 +1,16 @@
 package updater
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -32,6 +35,124 @@ var (
 
 func init() {
 	serviceManager = service.NewManager()
+}
+
+// ensureHomeDirectory determines the home directory using multiple fallback strategies
+func ensureHomeDirectory() (string, error) {
+	// Strategy 1: Check $HOME environment variable
+	if home := os.Getenv("HOME"); home != "" {
+		LogInfo("Home directory detected from $HOME environment variable: %s", home)
+		return home, nil
+	}
+
+	// Strategy 2: Use os.UserHomeDir()
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		LogInfo("Home directory detected using os.UserHomeDir(): %s", home)
+		return home, nil
+	}
+
+	// Strategy 3: Use user.Current() to get home directory
+	if currentUser, err := user.Current(); err == nil && currentUser.HomeDir != "" {
+		LogInfo("Home directory detected using user.Current(): %s", currentUser.HomeDir)
+		return currentUser.HomeDir, nil
+	}
+
+	// Strategy 4: Parse /etc/passwd for current UID (Linux/Unix fallback)
+	if runtime.GOOS == "linux" || runtime.GOOS == "darwin" {
+		if home, err := getHomeFromPasswd(); err == nil && home != "" {
+			LogInfo("Home directory detected from /etc/passwd: %s", home)
+			return home, nil
+		}
+	}
+
+	// All strategies failed
+	return "", fmt.Errorf("unable to determine home directory: all detection strategies failed")
+}
+
+// getHomeFromPasswd reads /etc/passwd to find the home directory for the current UID
+func getHomeFromPasswd() (string, error) {
+	// Get current UID
+	uid := os.Getuid()
+
+	// Open /etc/passwd
+	file, err := os.Open("/etc/passwd")
+	if err != nil {
+		return "", fmt.Errorf("failed to open /etc/passwd: %w", err)
+	}
+	defer file.Close()
+
+	// Parse /etc/passwd line by line
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		// Skip comments and empty lines
+		if strings.HasPrefix(line, "#") || strings.TrimSpace(line) == "" {
+			continue
+		}
+
+		// Parse passwd entry: username:password:uid:gid:gecos:home:shell
+		fields := strings.Split(line, ":")
+		if len(fields) < 6 {
+			continue
+		}
+
+		// Check if UID matches
+		entryUID, err := strconv.Atoi(fields[2])
+		if err != nil {
+			continue
+		}
+
+		if entryUID == uid {
+			homeDir := fields[5]
+			if homeDir != "" {
+				return homeDir, nil
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("error reading /etc/passwd: %w", err)
+	}
+
+	return "", fmt.Errorf("home directory not found in /etc/passwd for UID %d", uid)
+}
+
+// setEnvironmentVariables ensures required environment variables are set for child processes
+func setEnvironmentVariables() error {
+	LogInfo("Setting up environment variables for update process...")
+
+	// Ensure $HOME is set
+	homeDir, err := ensureHomeDirectory()
+	if err != nil {
+		LogError("Failed to determine home directory: %v", err)
+		return fmt.Errorf("failed to determine home directory: %w", err)
+	}
+
+	// Set $HOME if not already set
+	if os.Getenv("HOME") == "" {
+		if err := os.Setenv("HOME", homeDir); err != nil {
+			LogError("Failed to set $HOME environment variable: %v", err)
+			return fmt.Errorf("failed to set $HOME: %w", err)
+		}
+		LogInfo("Set $HOME environment variable to: %s", homeDir)
+	} else {
+		LogInfo("$HOME environment variable already set to: %s", os.Getenv("HOME"))
+	}
+
+	// Set $GOPATH if not already set (default to $HOME/go)
+	if os.Getenv("GOPATH") == "" {
+		gopath := filepath.Join(homeDir, "go")
+		if err := os.Setenv("GOPATH", gopath); err != nil {
+			LogError("Failed to set $GOPATH environment variable: %v", err)
+			return fmt.Errorf("failed to set $GOPATH: %w", err)
+		}
+		LogInfo("Set $GOPATH environment variable to: %s", gopath)
+	} else {
+		LogInfo("$GOPATH environment variable already set to: %s", os.Getenv("GOPATH"))
+	}
+
+	LogInfo("Environment variables configured successfully")
+	return nil
 }
 
 // Run is the main updater loop that checks for updates every CheckInterval
@@ -332,6 +453,14 @@ func parseVersion(version string) [3]int {
 func performUpdate(targetVersion string) error {
 	LogInfo("=== Starting update to %s ===", targetVersion)
 
+	// Set up environment variables before any operations
+	LogInfo("Setting up environment for update...")
+	if err := setEnvironmentVariables(); err != nil {
+		LogError("Environment setup failed: %v", err)
+		return fmt.Errorf("failed to set up environment: %w", err)
+	}
+	LogInfo("Environment setup completed successfully")
+
 	// Get current version before any changes
 	currentVersion, err := getInstalledVersion()
 	if err != nil {
@@ -353,18 +482,6 @@ func performUpdate(targetVersion string) error {
 	if err != nil {
 		return fmt.Errorf("failed to create backup: %w", err)
 	}
-	// Ensure backup is cleaned up on success
-	defer func() {
-		if backup != nil && backup.BackupPath != "" {
-			// Only remove backup if update was successful (no panic/error)
-			if r := recover(); r == nil {
-				LogInfo("Cleaning up backup file: %s", backup.BackupPath)
-				if err := os.Remove(backup.BackupPath); err != nil && !os.IsNotExist(err) {
-					LogWarning("Failed to remove backup file: %v", err)
-				}
-			}
-		}
-	}()
 
 	// Wrap update steps in error handling with rollback
 	updateErr := func() error {
@@ -461,6 +578,14 @@ func performUpdate(targetVersion string) error {
 		return fmt.Errorf("update failed, rolled back to version %s: %w", backup.Version, updateErr)
 	}
 
+	// Update successful - clean up backup file
+	LogInfo("Update completed successfully, cleaning up backup file...")
+	if err := cleanupBackupFile(backup.BackupPath); err != nil {
+		LogWarning("Failed to clean up backup file: %v", err)
+		LogWarning("Backup file may need to be manually deleted: %s", backup.BackupPath)
+		// Don't fail the update for cleanup errors
+	}
+
 	LogInfo("=== Update completed successfully ===")
 	return nil
 }
@@ -478,22 +603,25 @@ func cleanupOldFiles() error {
 		LogInfo("Deleted: %s", binaryPath)
 	}
 
-	// Delete backup binary (.old)
+	// Delete legacy backup binary (.old)
 	backupOldPath := binaryPath + ".old"
-	LogInfo("Checking for backup file: %s", backupOldPath)
+	LogInfo("Checking for legacy backup file: %s", backupOldPath)
 	if err := os.Remove(backupOldPath); err != nil && !os.IsNotExist(err) {
-		errors = append(errors, fmt.Sprintf("failed to delete backup %s: %v", backupOldPath, err))
+		errors = append(errors, fmt.Sprintf("failed to delete legacy backup %s: %v", backupOldPath, err))
 	} else if err == nil {
-		LogInfo("Deleted: %s", backupOldPath)
+		LogInfo("Deleted legacy backup: %s", backupOldPath)
+	} else if os.IsNotExist(err) {
+		LogInfo("No legacy backup file found (this is normal)")
 	}
 
-	// Delete backup binary (.backup)
+	// Preserve current backup binary (.backup) for potential rollback
 	backupPath := binaryPath + ".backup"
-	LogInfo("Checking for backup file: %s", backupPath)
-	if err := os.Remove(backupPath); err != nil && !os.IsNotExist(err) {
-		errors = append(errors, fmt.Sprintf("failed to delete backup %s: %v", backupPath, err))
-	} else if err == nil {
-		LogInfo("Deleted: %s", backupPath)
+	LogInfo("Checking for current backup file: %s", backupPath)
+	if _, err := os.Stat(backupPath); err == nil {
+		LogInfo("Preserving backup file for potential rollback: %s", backupPath)
+	} else if os.IsNotExist(err) {
+		LogWarning("Backup file not found at: %s", backupPath)
+		LogWarning("Rollback will not be possible if update fails")
 	}
 
 	// Verify database is preserved
@@ -841,7 +969,13 @@ func rollback(backup *BackupInfo) error {
 	// Step 1: Verify backup file exists
 	LogInfo("Step 1: Verifying backup file exists...")
 	if _, err := os.Stat(backup.BackupPath); os.IsNotExist(err) {
-		return fmt.Errorf("backup file not found at %s", backup.BackupPath)
+		LogCritical("Backup file not found at %s", backup.BackupPath)
+		LogCritical("RECOVERY INSTRUCTIONS:")
+		LogCritical("  1. The system is in an unrecoverable state without the backup file")
+		LogCritical("  2. You may need to manually reinstall the sentinel binary")
+		LogCritical("  3. Check if a backup exists at an alternate location")
+		LogCritical("  4. Contact support if you need assistance with manual recovery")
+		return fmt.Errorf("backup file not found at %s - manual recovery required", backup.BackupPath)
 	}
 	LogInfo("Backup file verified")
 
@@ -852,12 +986,22 @@ func rollback(backup *BackupInfo) error {
 	// Read backup file
 	backupData, err := os.ReadFile(backup.BackupPath)
 	if err != nil {
-		return fmt.Errorf("failed to read backup file: %w", err)
+		LogCritical("Failed to read backup file: %v", err)
+		LogCritical("RECOVERY INSTRUCTIONS:")
+		LogCritical("  1. Verify the backup file has correct permissions: %s", backup.BackupPath)
+		LogCritical("  2. Check disk space and file system integrity")
+		LogCritical("  3. Attempt manual restoration of the backup file")
+		return fmt.Errorf("failed to read backup file: %w - manual recovery may be required", err)
 	}
 
 	// Write to binary location
 	if err := os.WriteFile(binaryPath, backupData, 0755); err != nil {
-		return fmt.Errorf("failed to restore binary: %w", err)
+		LogCritical("Failed to restore binary: %v", err)
+		LogCritical("RECOVERY INSTRUCTIONS:")
+		LogCritical("  1. Verify write permissions to: %s", binaryPath)
+		LogCritical("  2. Check available disk space")
+		LogCritical("  3. Manually copy backup file from %s to %s", backup.BackupPath, binaryPath)
+		return fmt.Errorf("failed to restore binary: %w - manual recovery required", err)
 	}
 	LogInfo("Binary restored to: %s", binaryPath)
 
@@ -876,24 +1020,67 @@ func rollback(backup *BackupInfo) error {
 	// Step 3: Reinstall service using service manager
 	LogInfo("Step 3: Reinstalling service...")
 	if err := serviceManager.Install(MainAgentServiceName, binaryPath); err != nil {
-		return fmt.Errorf("failed to reinstall service: %w", err)
+		LogError("Failed to reinstall service: %v", err)
+		LogError("RECOVERY INSTRUCTIONS:")
+		LogError("  1. The binary has been restored to: %s", binaryPath)
+		LogError("  2. Manually reinstall the service using your system's service manager")
+		LogError("  3. Backup file preserved at: %s", backup.BackupPath)
+		return fmt.Errorf("failed to reinstall service: %w - manual service installation required", err)
 	}
 	LogInfo("Service reinstalled successfully")
 
 	// Step 4: Start service using service manager
 	LogInfo("Step 4: Starting service...")
 	if err := serviceManager.Start(MainAgentServiceName); err != nil {
-		return fmt.Errorf("failed to start service: %w", err)
+		LogError("Failed to start service: %v", err)
+		LogError("RECOVERY INSTRUCTIONS:")
+		LogError("  1. The service has been reinstalled but failed to start")
+		LogError("  2. Check service logs for startup errors")
+		LogError("  3. Manually start the service: systemctl start %s (Linux) or equivalent", MainAgentServiceName)
+		LogError("  4. Backup file preserved at: %s", backup.BackupPath)
+		return fmt.Errorf("failed to start service: %w - manual service start required", err)
 	}
 	LogInfo("Service started successfully")
 
 	// Step 5: Verify service is running
 	LogInfo("Step 5: Verifying service is running...")
 	if err := verifyMainAgentRunning(); err != nil {
-		return fmt.Errorf("service not running after rollback: %w", err)
+		LogError("Service not running after rollback: %v", err)
+		LogError("RECOVERY INSTRUCTIONS:")
+		LogError("  1. The service was started but verification failed")
+		LogError("  2. Check service status manually: systemctl status %s (Linux) or equivalent", MainAgentServiceName)
+		LogError("  3. Review service logs for errors")
+		LogError("  4. Backup file preserved at: %s", backup.BackupPath)
+		return fmt.Errorf("service not running after rollback: %w - manual verification required", err)
 	}
 	LogInfo("Service verified running")
 
+	// Preserve backup file for manual inspection after rollback
 	LogInfo("=== Rollback completed successfully to version %s ===", backup.Version)
+	LogInfo("Backup file preserved for manual inspection at: %s", backup.BackupPath)
+	LogInfo("You may manually delete the backup file after verifying system health:")
+	LogInfo("  rm %s", backup.BackupPath)
+
+	return nil
+}
+
+// cleanupBackupFile removes the backup file after a successful update
+func cleanupBackupFile(backupPath string) error {
+	LogInfo("Cleaning up backup file after successful update...")
+	LogInfo("Backup file path: %s", backupPath)
+
+	// Check if backup file exists
+	if _, err := os.Stat(backupPath); os.IsNotExist(err) {
+		LogWarning("Backup file not found at: %s (may have been already deleted)", backupPath)
+		return nil
+	}
+
+	// Delete the backup file
+	if err := os.Remove(backupPath); err != nil {
+		LogError("Failed to delete backup file: %v", err)
+		return fmt.Errorf("failed to delete backup file: %w", err)
+	}
+
+	LogInfo("Backup file deleted successfully: %s", backupPath)
 	return nil
 }
