@@ -567,14 +567,73 @@ func performUpdate(targetVersion string) error {
 	// If update failed, trigger rollback
 	if updateErr != nil {
 		LogError("Update failed: %v", updateErr)
+
+		// Check if the failure was due to GCC installation
+		isGCCFailure := strings.Contains(updateErr.Error(), "GCC_INSTALLATION_FAILED")
+
+		if isGCCFailure {
+			LogError("")
+			LogError("=== UPDATE FAILED DUE TO GCC INSTALLATION FAILURE ===")
+			LogError("The update process failed because GCC (C compiler) could not be installed or made available")
+			LogError("This is required for compiling CGO-enabled Go code on Windows")
+			LogError("")
+		}
+
 		LogInfo("Triggering rollback to previous version...")
 
 		if rollbackErr := rollback(backup); rollbackErr != nil {
 			LogCritical("Rollback failed: %v", rollbackErr)
+
+			if isGCCFailure {
+				LogCritical("")
+				LogCritical("CRITICAL: Rollback failed after GCC installation failure")
+				LogCritical("System may be in an inconsistent state")
+				LogCritical("")
+				LogCritical("IMMEDIATE ACTIONS REQUIRED:")
+				LogCritical("  1. Manually restore the backup file:")
+				LogCritical("     cp %s %s", backup.BackupPath, paths.GetMainAgentBinaryPath())
+				LogCritical("  2. Reinstall and start the service manually")
+				LogCritical("  3. After system is restored, install GCC before retrying update")
+				LogCritical("")
+			}
+
 			return fmt.Errorf("update failed and rollback failed: update error: %w, rollback error: %v", updateErr, rollbackErr)
 		}
 
 		LogInfo("Rollback successful, restored version %s", backup.Version)
+
+		if isGCCFailure {
+			LogInfo("")
+			LogInfo("=== ROLLBACK COMPLETED - GCC INSTALLATION REQUIRED ===")
+			LogInfo("The system has been restored to version %s", backup.Version)
+			LogInfo("The backup file has been preserved at: %s", backup.BackupPath)
+			LogInfo("")
+			LogInfo("BEFORE RETRYING THE UPDATE, YOU MUST INSTALL GCC:")
+			LogInfo("")
+			LogInfo("Option 1 - Automatic installation using winget (recommended):")
+			LogInfo("  1. Ensure winget is installed:")
+			LogInfo("     - Download from: https://aka.ms/getwinget")
+			LogInfo("     - Or install 'App Installer' from Microsoft Store")
+			LogInfo("  2. Install GCC:")
+			LogInfo("     winget install BrechtSanders.WinLibs.POSIX.UCRT --accept-source-agreements --accept-package-agreements")
+			LogInfo("  3. Verify installation:")
+			LogInfo("     gcc --version")
+			LogInfo("  4. Retry the update")
+			LogInfo("")
+			LogInfo("Option 2 - Manual installation:")
+			LogInfo("  1. Download WinLibs from: https://winlibs.com/")
+			LogInfo("  2. Download the latest UCRT runtime build (POSIX threads)")
+			LogInfo("  3. Extract to C:\\Program Files\\WinLibs")
+			LogInfo("  4. Add to PATH: C:\\Program Files\\WinLibs\\mingw64\\bin")
+			LogInfo("  5. Verify installation:")
+			LogInfo("     gcc --version")
+			LogInfo("  6. Restart the updater service")
+			LogInfo("  7. The update will be retried automatically")
+			LogInfo("")
+			LogInfo("For more details, review the error messages above")
+			LogInfo("")
+		}
+
 		return fmt.Errorf("update failed, rolled back to version %s: %w", backup.Version, updateErr)
 	}
 
@@ -655,6 +714,35 @@ func cleanupOldFiles() error {
 func downloadAndCompile(version string) (string, error) {
 	LogInfo("Setting up Go environment for compilation...")
 
+	// On Windows, ensure GCC is available before proceeding
+	if runtime.GOOS == "windows" {
+		LogInfo("Windows platform detected")
+		LogInfo("CGO compilation requires GCC (C compiler) on Windows")
+		LogInfo("Checking GCC availability before proceeding with compilation...")
+		LogInfo("")
+
+		if err := ensureGCCAvailable(); err != nil {
+			LogError("Failed to ensure GCC availability")
+			LogError("Error: %v", err)
+			LogError("")
+			LogError("COMPILATION CANNOT PROCEED:")
+			LogError("  CGO-enabled Go code requires a C compiler (GCC)")
+			LogError("  The update process cannot continue without GCC")
+			LogError("")
+			LogError("NEXT STEPS:")
+			LogError("  1. Review the error messages above for specific failure reasons")
+			LogError("  2. Follow the recovery instructions provided")
+			LogError("  3. Retry the update after resolving GCC availability")
+			LogError("")
+			LogError("The update will now be rolled back to preserve system stability")
+			// Return a wrapped error with a specific marker for GCC installation failure
+			return "", fmt.Errorf("GCC_INSTALLATION_FAILED: %w", err)
+		}
+
+		LogInfo("GCC availability confirmed - proceeding with compilation")
+		LogInfo("")
+	}
+
 	// Setup Go environment variables
 	gopath := os.Getenv("GOPATH")
 	if gopath == "" {
@@ -708,23 +796,6 @@ func downloadAndCompile(version string) (string, error) {
 	LogInfo("  GOCACHE=%s", gocache)
 	LogInfo("  GOMODCACHE=%s", gomodcache)
 
-	// On Windows, locate and add GCC to PATH
-	if runtime.GOOS == "windows" {
-		LogInfo("Windows detected, checking for GCC...")
-		gccPath, err := findGCCOnWindows()
-		if err != nil {
-			LogWarning("GCC not found: %v", err)
-			LogWarning("CGO compilation may fail without GCC")
-		} else {
-			LogInfo("Found GCC at: %s", gccPath)
-			// Add GCC directory to PATH
-			pathEnv := os.Getenv("PATH")
-			newPath := fmt.Sprintf("%s%c%s", gccPath, os.PathListSeparator, pathEnv)
-			env = setEnvVar(env, "PATH", newPath)
-			LogInfo("Added GCC to PATH")
-		}
-	}
-
 	// Execute go install command
 	moduleWithVersion := fmt.Sprintf("%s/cmd/sentinel@%s", MainAgentModule, version)
 	LogInfo("Executing: go install %s", moduleWithVersion)
@@ -763,10 +834,40 @@ func downloadAndCompile(version string) (string, error) {
 	return compiledBinaryPath, nil
 }
 
-// findGCCOnWindows attempts to locate GCC on Windows systems
-func findGCCOnWindows() (string, error) {
+// checkGCCInPath checks if GCC is available in the system PATH
+func checkGCCInPath() bool {
+	LogInfo("Checking for GCC in PATH...")
+	gccPath, err := exec.LookPath("gcc")
+	if err == nil {
+		LogInfo("GCC found in PATH: %s", gccPath)
+
+		// Log GCC version for troubleshooting
+		cmd := exec.Command("gcc", "--version")
+		if output, vErr := cmd.Output(); vErr == nil {
+			versionOutput := strings.TrimSpace(string(output))
+			versionLines := strings.Split(versionOutput, "\n")
+			if len(versionLines) > 0 {
+				LogInfo("GCC version: %s", versionLines[0])
+			}
+		} else {
+			LogWarning("Could not retrieve GCC version: %v", vErr)
+		}
+
+		return true
+	}
+	LogInfo("GCC not found in PATH")
+	LogInfo("GCC detection error: %v", err)
+	return false
+}
+
+// checkGCCInCommonLocations searches for GCC in standard installation directories
+func checkGCCInCommonLocations() (string, error) {
+	LogInfo("Searching for GCC in common installation directories...")
+
 	// Common GCC installation paths on Windows
 	commonPaths := []string{
+		"C:\\Program Files\\WinLibs\\mingw64\\bin",
+		"C:\\Program Files\\WinLibs\\mingw32\\bin",
 		"C:\\MinGW\\bin",
 		"C:\\MinGW64\\bin",
 		"C:\\TDM-GCC-64\\bin",
@@ -776,6 +877,39 @@ func findGCCOnWindows() (string, error) {
 		"C:\\Program Files (x86)\\mingw-w64\\bin",
 	}
 
+	LogInfo("Checking %d common installation paths...", len(commonPaths))
+
+	// Check each common path
+	for _, path := range commonPaths {
+		gccExe := filepath.Join(path, "gcc.exe")
+		LogInfo("Checking: %s", gccExe)
+		if _, err := os.Stat(gccExe); err == nil {
+			LogInfo("GCC found at: %s", path)
+
+			// Log GCC version for troubleshooting
+			cmd := exec.Command(gccExe, "--version")
+			if output, vErr := cmd.Output(); vErr == nil {
+				versionOutput := strings.TrimSpace(string(output))
+				versionLines := strings.Split(versionOutput, "\n")
+				if len(versionLines) > 0 {
+					LogInfo("GCC version: %s", versionLines[0])
+				}
+			}
+
+			return path, nil
+		}
+	}
+
+	LogInfo("GCC not found in any of the %d common installation directories", len(commonPaths))
+	LogInfo("Searched paths:")
+	for _, path := range commonPaths {
+		LogInfo("  - %s", path)
+	}
+	return "", fmt.Errorf("GCC not found in common locations")
+}
+
+// findGCCOnWindows attempts to locate GCC on Windows systems
+func findGCCOnWindows() (string, error) {
 	// Check if gcc is already in PATH
 	if _, err := exec.LookPath("gcc"); err == nil {
 		// GCC found in PATH, get its directory
@@ -788,14 +922,522 @@ func findGCCOnWindows() (string, error) {
 	}
 
 	// Check common installation paths
-	for _, path := range commonPaths {
+	path, err := checkGCCInCommonLocations()
+	if err == nil {
+		return path, nil
+	}
+
+	return "", fmt.Errorf("GCC not found in common locations or PATH")
+}
+
+// verifyWingetAvailable checks if winget is available on the system
+func verifyWingetAvailable() error {
+	LogInfo("Verifying winget is available...")
+	LogInfo("Executing: winget --version")
+
+	// Execute "winget --version" to check availability
+	cmd := exec.Command("winget", "--version")
+	output, err := cmd.Output()
+
+	if err != nil {
+		// winget not found or failed to execute
+		LogError("winget is not available on this system")
+		LogError("Error details: %v", err)
+		LogError("")
+		LogError("GCC installation requires winget (Windows Package Manager)")
+		LogError("")
+		LogError("INSTALLATION INSTRUCTIONS:")
+		LogError("  1. Install winget from: https://aka.ms/getwinget")
+		LogError("  2. Or install 'App Installer' from Microsoft Store")
+		LogError("  3. Restart your terminal/command prompt after installation")
+		LogError("  4. Verify installation by running: winget --version")
+		LogError("  5. After installing winget, retry the update")
+		LogError("")
+		LogError("ALTERNATIVE - MANUAL GCC INSTALLATION:")
+		LogError("  If you prefer to install GCC manually:")
+		LogError("  1. Download WinLibs from: https://winlibs.com/")
+		LogError("  2. Extract to C:\\Program Files\\WinLibs")
+		LogError("  3. Add C:\\Program Files\\WinLibs\\mingw64\\bin to your PATH")
+		LogError("  4. Verify with: gcc --version")
+		LogError("")
+		LogError("QUICK INSTALL (if winget is available):")
+		LogError("  Run: winget install BrechtSanders.WinLibs.POSIX.UCRT")
+
+		return fmt.Errorf("winget is not available: %w", err)
+	}
+
+	// Parse output to extract version information
+	versionOutput := strings.TrimSpace(string(output))
+	if versionOutput == "" {
+		LogWarning("winget returned empty version output")
+		LogWarning("This may indicate an incomplete winget installation")
+		return fmt.Errorf("winget version detection failed: empty output")
+	}
+
+	// Log the detected winget version
+	LogInfo("winget version detected: %s", versionOutput)
+	LogInfo("winget is available and ready for use")
+
+	return nil
+}
+
+// detectGCCInstallPath detects the GCC installation path after installation
+func detectGCCInstallPath() (string, error) {
+	LogInfo("Detecting GCC installation path after winget installation...")
+
+	// Search WinLibs default paths
+	winlibsPaths := []string{
+		"C:\\Program Files\\WinLibs\\mingw64\\bin",
+		"C:\\Program Files\\WinLibs\\mingw32\\bin",
+		"C:\\Program Files (x86)\\WinLibs\\mingw64\\bin",
+		"C:\\Program Files (x86)\\WinLibs\\mingw32\\bin",
+	}
+
+	LogInfo("Searching %d WinLibs default installation paths...", len(winlibsPaths))
+	for _, path := range winlibsPaths {
 		gccExe := filepath.Join(path, "gcc.exe")
+		LogInfo("Checking WinLibs path: %s", gccExe)
 		if _, err := os.Stat(gccExe); err == nil {
+			LogInfo("GCC found at WinLibs default path: %s", path)
+
+			// Log GCC version for verification
+			cmd := exec.Command(gccExe, "--version")
+			if output, vErr := cmd.Output(); vErr == nil {
+				versionOutput := strings.TrimSpace(string(output))
+				versionLines := strings.Split(versionOutput, "\n")
+				if len(versionLines) > 0 {
+					LogInfo("GCC version: %s", versionLines[0])
+				}
+			}
+
 			return path, nil
 		}
 	}
 
-	return "", fmt.Errorf("GCC not found in common locations or PATH")
+	LogInfo("GCC not found in WinLibs default paths")
+	LogInfo("Using 'where gcc' command as fallback detection method...")
+
+	// Use "where gcc" command as fallback
+	cmd := exec.Command("where", "gcc")
+	output, err := cmd.Output()
+	if err != nil {
+		LogError("Failed to execute 'where gcc' command: %v", err)
+		LogError("GCC not found after installation")
+		LogError("")
+		LogError("This may indicate:")
+		LogError("  - GCC installation did not complete successfully")
+		LogError("  - GCC was installed to a non-standard location")
+		LogError("  - System PATH was not updated by the installer")
+		LogError("")
+		LogError("TROUBLESHOOTING STEPS:")
+		LogError("  1. Check if GCC was actually installed:")
+		LogError("     winget list | findstr WinLibs")
+		LogError("  2. Search for gcc.exe manually:")
+		LogError("     dir /s /b \"C:\\Program Files\\gcc.exe\"")
+		LogError("  3. Check winget installation logs for errors")
+		LogError("")
+		LogError("MANUAL RECOVERY OPTIONS:")
+		LogError("  Option 1 - Reinstall GCC:")
+		LogError("    winget uninstall BrechtSanders.WinLibs.POSIX.UCRT")
+		LogError("    winget install BrechtSanders.WinLibs.POSIX.UCRT")
+		LogError("")
+		LogError("  Option 2 - Manual installation:")
+		LogError("    1. Download WinLibs from: https://winlibs.com/")
+		LogError("    2. Extract to C:\\Program Files\\WinLibs")
+		LogError("    3. Add C:\\Program Files\\WinLibs\\mingw64\\bin to PATH")
+		LogError("    4. Verify: gcc --version")
+		return "", fmt.Errorf("GCC not found after installation: %w", err)
+	}
+
+	// Parse command output to extract GCC binary path
+	outputStr := strings.TrimSpace(string(output))
+	if outputStr == "" {
+		LogError("'where gcc' command returned empty output")
+		LogError("GCC was installed but cannot be found in PATH")
+		LogError("")
+		LogError("MANUAL RECOVERY:")
+		LogError("  1. Verify GCC installation:")
+		LogError("     winget list | findstr WinLibs")
+		LogError("  2. Find GCC installation manually:")
+		LogError("     dir /s /b \"C:\\Program Files\\gcc.exe\"")
+		LogError("  3. Add the bin directory to your PATH manually")
+		LogError("  4. Or reinstall:")
+		LogError("     winget uninstall BrechtSanders.WinLibs.POSIX.UCRT")
+		LogError("     winget install BrechtSanders.WinLibs.POSIX.UCRT")
+		return "", fmt.Errorf("GCC not found: 'where gcc' returned empty output")
+	}
+
+	// 'where' command may return multiple paths, take the first one
+	lines := strings.Split(outputStr, "\n")
+	gccPath := strings.TrimSpace(lines[0])
+
+	if gccPath == "" {
+		LogError("Failed to parse GCC path from 'where gcc' output")
+		LogError("Output was: %s", outputStr)
+		return "", fmt.Errorf("failed to parse GCC path from output")
+	}
+
+	// Extract the bin directory path
+	binDir := filepath.Dir(gccPath)
+	LogInfo("GCC found via 'where gcc' command: %s", gccPath)
+	LogInfo("GCC bin directory: %s", binDir)
+
+	// Log GCC version for verification
+	cmd = exec.Command(gccPath, "--version")
+	if output, vErr := cmd.Output(); vErr == nil {
+		versionOutput := strings.TrimSpace(string(output))
+		versionLines := strings.Split(versionOutput, "\n")
+		if len(versionLines) > 0 {
+			LogInfo("GCC version: %s", versionLines[0])
+		}
+	}
+
+	return binDir, nil
+}
+
+// updatePATHEnvironment adds the GCC bin directory to the PATH environment variable
+func updatePATHEnvironment(gccBinPath string) error {
+	LogInfo("Updating PATH environment variable with GCC bin directory...")
+	LogInfo("GCC bin path to add: %s", gccBinPath)
+
+	// Get current PATH environment variable
+	currentPath := os.Getenv("PATH")
+	if currentPath == "" {
+		LogWarning("PATH environment variable is empty")
+	}
+
+	// Check if GCC path already exists in PATH (avoid duplicates)
+	pathSeparator := string(os.PathListSeparator)
+	pathEntries := strings.Split(currentPath, pathSeparator)
+
+	for _, entry := range pathEntries {
+		// Normalize paths for comparison (handle case sensitivity and trailing slashes)
+		normalizedEntry := filepath.Clean(entry)
+		normalizedGCCPath := filepath.Clean(gccBinPath)
+
+		if strings.EqualFold(normalizedEntry, normalizedGCCPath) {
+			LogInfo("GCC path already exists in PATH, skipping duplicate entry")
+			LogInfo("Existing PATH entry: %s", entry)
+			return nil
+		}
+	}
+
+	// Prepend GCC bin path to PATH using os.PathListSeparator
+	newPath := gccBinPath + pathSeparator + currentPath
+	LogInfo("Prepending GCC bin path to PATH")
+
+	// Set updated PATH using os.Setenv()
+	if err := os.Setenv("PATH", newPath); err != nil {
+		LogError("Failed to update PATH environment variable: %v", err)
+		return fmt.Errorf("failed to update PATH: %w", err)
+	}
+
+	LogInfo("PATH environment variable updated successfully")
+	LogInfo("New PATH: %s", newPath)
+
+	return nil
+}
+
+// executeWingetInstall executes the winget command to install GCC
+func executeWingetInstall() error {
+	LogInfo("Executing winget install command for GCC...")
+
+	// Build winget command with flags
+	wingetCmd := "winget"
+	wingetArgs := []string{
+		"install",
+		"BrechtSanders.WinLibs.POSIX.UCRT",
+		"--silent",
+		"--accept-source-agreements",
+		"--accept-package-agreements",
+	}
+
+	// Log the exact command being executed
+	fullCommand := fmt.Sprintf("%s %s", wingetCmd, strings.Join(wingetArgs, " "))
+	LogInfo("Executing command: %s", fullCommand)
+	LogInfo("Package: BrechtSanders.WinLibs.POSIX.UCRT (WinLibs GCC with POSIX threads and UCRT)")
+	LogInfo("Installation mode: Silent (non-interactive)")
+	LogInfo("Timeout: 10 minutes")
+	LogInfo("")
+	LogInfo("GCC installation in progress...")
+	LogInfo("This may take several minutes depending on your internet connection")
+	LogInfo("Please wait while the package is downloaded and installed...")
+
+	// Create command with 10-minute timeout
+	cmd := exec.Command(wingetCmd, wingetArgs...)
+
+	// Create a channel to signal completion
+	done := make(chan error, 1)
+	var output []byte
+	startTime := time.Now()
+
+	// Run command in a goroutine
+	go func() {
+		var err error
+		output, err = cmd.CombinedOutput()
+		done <- err
+	}()
+
+	// Wait for completion or timeout
+	select {
+	case err := <-done:
+		duration := time.Since(startTime)
+		LogInfo("Installation command completed in %v", duration)
+
+		// Log installation output
+		if len(output) > 0 {
+			LogInfo("Winget installation output:")
+			LogInfo("--- BEGIN WINGET OUTPUT ---")
+			LogInfo("%s", string(output))
+			LogInfo("--- END WINGET OUTPUT ---")
+		}
+
+		if err != nil {
+			LogError("GCC installation via winget failed")
+			LogError("Error: %v", err)
+			LogError("Duration: %v", duration)
+			if len(output) > 0 {
+				LogError("Output: %s", string(output))
+			}
+			LogError("")
+			LogError("POSSIBLE CAUSES:")
+			LogError("  - Network connectivity issues")
+			LogError("  - Insufficient permissions (try running as Administrator)")
+			LogError("  - Package repository unavailable")
+			LogError("  - Disk space insufficient")
+			LogError("  - Conflicting software or antivirus blocking installation")
+			LogError("")
+			LogError("TROUBLESHOOTING STEPS:")
+			LogError("  1. Check internet connection")
+			LogError("  2. Verify winget is up to date: winget upgrade")
+			LogError("  3. Check available disk space")
+			LogError("  4. Temporarily disable antivirus if applicable")
+			LogError("  5. Review winget logs for detailed error information")
+			LogError("")
+			LogError("MANUAL INSTALLATION INSTRUCTIONS:")
+			LogError("  Option 1 - Using winget (recommended):")
+			LogError("    1. Open PowerShell or Command Prompt as Administrator")
+			LogError("    2. Run: %s", fullCommand)
+			LogError("    3. Verify installation: gcc --version")
+			LogError("    4. Retry the update")
+			LogError("")
+			LogError("  Option 2 - Manual download:")
+			LogError("    1. Visit: https://winlibs.com/")
+			LogError("    2. Download the latest UCRT runtime build")
+			LogError("    3. Extract to C:\\Program Files\\WinLibs")
+			LogError("    4. Add C:\\Program Files\\WinLibs\\mingw64\\bin to PATH")
+			LogError("    5. Verify: gcc --version")
+			LogError("    6. Retry the update")
+			return fmt.Errorf("winget install failed: %w", err)
+		}
+
+		LogInfo("GCC installation completed successfully in %v", duration)
+		LogInfo("Proceeding to detect installation path...")
+		return nil
+
+	case <-time.After(10 * time.Minute):
+		// Timeout occurred
+		if cmd.Process != nil {
+			LogWarning("Attempting to terminate installation process due to timeout...")
+			if killErr := cmd.Process.Kill(); killErr != nil {
+				LogError("Failed to kill installation process: %v", killErr)
+			} else {
+				LogInfo("Installation process terminated")
+			}
+		}
+
+		LogError("GCC installation timed out after 10 minutes")
+		LogError("")
+		LogError("TIMEOUT CAUSES:")
+		LogError("  - Slow internet connection")
+		LogError("  - Large package download size")
+		LogError("  - Network interruptions")
+		LogError("  - System resource constraints")
+		LogError("  - Winget repository issues")
+		LogError("")
+		LogError("TROUBLESHOOTING STEPS:")
+		LogError("  1. Check your internet connection speed and stability")
+		LogError("  2. Verify network is not blocking winget connections")
+		LogError("  3. Check system resources (CPU, memory, disk)")
+		LogError("  4. Try again during off-peak hours")
+		LogError("  5. Consider manual installation if timeout persists")
+		LogError("")
+		LogError("RECOVERY INSTRUCTIONS:")
+		LogError("  Option 1 - Retry with winget:")
+		LogError("    1. Ensure stable internet connection")
+		LogError("    2. Run: winget install BrechtSanders.WinLibs.POSIX.UCRT")
+		LogError("    3. Monitor progress (may take 5-10 minutes)")
+		LogError("    4. Retry the update after successful installation")
+		LogError("")
+		LogError("  Option 2 - Manual installation:")
+		LogError("    1. Download from: https://winlibs.com/")
+		LogError("    2. Extract to C:\\Program Files\\WinLibs")
+		LogError("    3. Add C:\\Program Files\\WinLibs\\mingw64\\bin to PATH")
+		LogError("    4. Verify: gcc --version")
+		LogError("    5. Retry the update")
+		return fmt.Errorf("GCC installation timed out after 10 minutes")
+	}
+}
+
+// installGCCWithWinget orchestrates the GCC installation process
+func installGCCWithWinget() error {
+	LogInfo("=== Starting automatic GCC installation via winget ===")
+	LogInfo("This process will:")
+	LogInfo("  1. Verify winget is available")
+	LogInfo("  2. Install GCC using winget")
+	LogInfo("  3. Detect the installation path")
+	LogInfo("  4. Update PATH environment variable")
+	LogInfo("")
+
+	// Step 1: Verify winget is available
+	LogInfo("Step 1/4: Verifying winget availability...")
+	if err := verifyWingetAvailable(); err != nil {
+		LogError("Step 1/4 failed: winget verification failed")
+		return fmt.Errorf("winget verification failed: %w", err)
+	}
+	LogInfo("Step 1/4 completed: winget is available")
+	LogInfo("")
+
+	// Step 2: Execute winget install command
+	LogInfo("Step 2/4: Installing GCC via winget...")
+	if err := executeWingetInstall(); err != nil {
+		LogError("Step 2/4 failed: GCC installation failed")
+		return fmt.Errorf("GCC installation failed: %w", err)
+	}
+	LogInfo("Step 2/4 completed: GCC installed successfully")
+	LogInfo("")
+
+	// Step 3: Detect GCC installation path
+	LogInfo("Step 3/4: Detecting GCC installation path...")
+	gccBinPath, err := detectGCCInstallPath()
+	if err != nil {
+		LogError("Step 3/4 failed: Could not detect GCC installation path")
+		return fmt.Errorf("failed to detect GCC installation path: %w", err)
+	}
+	LogInfo("Step 3/4 completed: GCC path detected at %s", gccBinPath)
+	LogInfo("")
+
+	// Step 4: Update PATH environment variable
+	LogInfo("Step 4/4: Updating PATH environment variable...")
+	if err := updatePATHEnvironment(gccBinPath); err != nil {
+		LogError("Step 4/4 failed: Could not update PATH")
+		return fmt.Errorf("failed to update PATH: %w", err)
+	}
+	LogInfo("Step 4/4 completed: PATH updated successfully")
+	LogInfo("")
+
+	LogInfo("=== GCC installation and PATH update completed successfully ===")
+	return nil
+}
+
+// ensureGCCAvailable ensures GCC is available for compilation
+func ensureGCCAvailable() error {
+	LogInfo("=== Ensuring GCC is available for compilation ===")
+	LogInfo("CGO requires a C compiler (GCC) to compile Go code with C dependencies")
+	LogInfo("")
+
+	// Step 1: Check if GCC is in PATH
+	LogInfo("Step 1: Checking if GCC is already in PATH...")
+	if checkGCCInPath() {
+		LogInfo("GCC is already available in PATH")
+		LogInfo("Skipping installation - GCC is ready for use")
+		LogInfo("GCC is available and ready for compilation")
+		LogInfo("")
+		return nil
+	}
+
+	// Step 2: Check if GCC is in common locations
+	LogInfo("Step 2: GCC not found in PATH, checking common installation directories...")
+	gccBinPath, err := checkGCCInCommonLocations()
+	if err == nil {
+		// Found in common location, update PATH
+		LogInfo("GCC found in common location: %s", gccBinPath)
+		LogInfo("Adding GCC to PATH for current process...")
+
+		if err := updatePATHEnvironment(gccBinPath); err != nil {
+			LogError("Failed to update PATH with GCC location")
+			LogError("Error: %v", err)
+			return fmt.Errorf("failed to update PATH with GCC location: %w", err)
+		}
+
+		// Verify GCC is now accessible
+		LogInfo("Verifying GCC is now accessible...")
+		if !checkGCCInPath() {
+			LogError("GCC was found but is still not accessible after PATH update")
+			LogError("This may indicate a PATH configuration issue")
+			LogError("")
+			LogError("MANUAL RECOVERY:")
+			LogError("  1. Verify GCC exists at: %s\\gcc.exe", gccBinPath)
+			LogError("  2. Add to system PATH manually via System Properties")
+			LogError("  3. Restart the updater service after PATH update")
+			return fmt.Errorf("GCC not accessible after PATH update")
+		}
+
+		LogInfo("GCC is now available for compilation")
+		LogInfo("")
+		return nil
+	}
+
+	// Step 3: GCC not found anywhere, trigger automatic installation
+	LogInfo("Step 3: GCC not found in PATH or common locations")
+	LogInfo("Automatic GCC installation will be attempted using winget")
+	LogInfo("")
+
+	if err := installGCCWithWinget(); err != nil {
+		LogError("Automatic GCC installation failed")
+		LogError("Error: %v", err)
+		LogError("")
+		LogError("The update cannot proceed without GCC")
+		LogError("Please install GCC manually and retry the update")
+		return fmt.Errorf("automatic GCC installation failed: %w", err)
+	}
+
+	// Step 4: Verify GCC is accessible after installation
+	LogInfo("Step 4: Verifying GCC is accessible after installation...")
+	if !checkGCCInPath() {
+		LogError("GCC was installed but is still not accessible in PATH")
+		LogError("This is unexpected - the installation appeared to succeed")
+		LogError("")
+		LogError("TROUBLESHOOTING:")
+		LogError("  1. Check if GCC is actually installed:")
+		LogError("     winget list | findstr WinLibs")
+		LogError("  2. Find GCC installation manually:")
+		LogError("     where gcc")
+		LogError("     dir /s /b \"C:\\Program Files\\gcc.exe\"")
+		LogError("  3. If found, add the bin directory to PATH manually")
+		LogError("")
+		LogError("MANUAL RECOVERY:")
+		LogError("  Option 1 - Reinstall:")
+		LogError("    winget uninstall BrechtSanders.WinLibs.POSIX.UCRT")
+		LogError("    winget install BrechtSanders.WinLibs.POSIX.UCRT")
+		LogError("")
+		LogError("  Option 2 - Manual installation:")
+		LogError("    1. Download from: https://winlibs.com/")
+		LogError("    2. Extract to C:\\Program Files\\WinLibs")
+		LogError("    3. Add C:\\Program Files\\WinLibs\\mingw64\\bin to PATH")
+		LogError("    4. Verify: gcc --version")
+		return fmt.Errorf("GCC not accessible after installation")
+	}
+
+	// Log GCC version after successful installation
+	LogInfo("GCC is now accessible in PATH")
+	cmd := exec.Command("gcc", "--version")
+	output, err := cmd.Output()
+	if err == nil {
+		versionOutput := strings.TrimSpace(string(output))
+		// Get first line of version output
+		versionLines := strings.Split(versionOutput, "\n")
+		if len(versionLines) > 0 {
+			LogInfo("GCC version: %s", versionLines[0])
+		}
+	} else {
+		LogWarning("Could not retrieve GCC version: %v", err)
+	}
+
+	LogInfo("GCC is available and ready for compilation")
+	LogInfo("=== GCC availability check completed successfully ===")
+	LogInfo("")
+	return nil
 }
 
 // setEnvVar sets or updates an environment variable in the env slice
