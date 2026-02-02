@@ -722,27 +722,35 @@ func downloadAndCompile(version string) (string, error) {
 		// Try to find GCC
 		gccBinPath := findGCCPath()
 
+		// Empty string means GCC is already in PATH, which is good
+		// Non-empty string means we found GCC and need to add it to PATH
+		// If findGCCPath returns empty AND checkGCCInPath returns false, then GCC is not found
 		if gccBinPath == "" {
-			LogError("GCC not found on system")
-			LogError("")
-			LogError("INSTALLATION REQUIRED:")
-			LogError("  Please install GCC using winget:")
-			LogError("  winget install BrechtSanders.WinLibs.POSIX.UCRT")
-			LogError("")
-			LogError("  After installation, restart the updater service and retry the update")
-			LogError("")
-			return "", fmt.Errorf("GCC not found - please install using: winget install BrechtSanders.WinLibs.POSIX.UCRT")
-		}
-
-		// Add to PATH for this process
-		currentPath := os.Getenv("PATH")
-		if !strings.Contains(currentPath, gccBinPath) {
-			newPath := gccBinPath + string(os.PathListSeparator) + currentPath
-			if err := os.Setenv("PATH", newPath); err != nil {
-				LogError("Failed to add GCC to PATH: %v", err)
-				return "", fmt.Errorf("failed to add GCC to PATH: %w", err)
+			// Check if GCC is actually in PATH
+			if !checkGCCInPath() {
+				LogError("GCC not found on system")
+				LogError("")
+				LogError("INSTALLATION REQUIRED:")
+				LogError("  Please install GCC using winget:")
+				LogError("  winget install BrechtSanders.WinLibs.POSIX.UCRT")
+				LogError("")
+				LogError("  After installation, restart the updater service and retry the update")
+				LogError("")
+				return "", fmt.Errorf("GCC not found - please install using: winget install BrechtSanders.WinLibs.POSIX.UCRT")
 			}
-			LogInfo("Added GCC to PATH: %s", gccBinPath)
+			// GCC is already in PATH, we're good
+			LogInfo("GCC is already accessible in PATH")
+		} else {
+			// Add to PATH for this process
+			currentPath := os.Getenv("PATH")
+			if !strings.Contains(currentPath, gccBinPath) {
+				newPath := gccBinPath + string(os.PathListSeparator) + currentPath
+				if err := os.Setenv("PATH", newPath); err != nil {
+					LogError("Failed to add GCC to PATH: %v", err)
+					return "", fmt.Errorf("failed to add GCC to PATH: %w", err)
+				}
+				LogInfo("Added GCC to PATH: %s", gccBinPath)
+			}
 		}
 
 		LogInfo("GCC is ready for compilation")
@@ -1687,6 +1695,7 @@ func verifyMainAgentRunning() error {
 type BackupInfo struct {
 	Version    string
 	BackupPath string
+	BinaryPath string // The original binary path where backup was created from
 	Timestamp  time.Time
 }
 
@@ -1724,12 +1733,14 @@ func createBackup(currentVersion string) (*BackupInfo, error) {
 	backup := &BackupInfo{
 		Version:    currentVersion,
 		BackupPath: backupPath,
+		BinaryPath: binaryPath, // Store the original binary path for rollback
 		Timestamp:  time.Now(),
 	}
 
 	LogInfo("Backup created successfully:")
 	LogInfo("  Version: %s", backup.Version)
 	LogInfo("  Path: %s", backup.BackupPath)
+	LogInfo("  Binary Path: %s", backup.BinaryPath)
 	LogInfo("  Size: %d bytes", backupInfo.Size())
 	LogInfo("  Timestamp: %s", backup.Timestamp.Format(time.RFC3339))
 
@@ -1757,7 +1768,9 @@ func rollback(backup *BackupInfo) error {
 
 	// Step 2: Restore binary from backup
 	LogInfo("Step 2: Restoring binary from backup...")
-	binaryPath := paths.GetMainAgentBinaryPath()
+	// Use the binary path stored in backup info to ensure we restore to the same location
+	binaryPath := backup.BinaryPath
+	LogInfo("Restoring to original binary path: %s", binaryPath)
 
 	// Read backup file
 	backupData, err := os.ReadFile(backup.BackupPath)
@@ -1768,6 +1781,14 @@ func rollback(backup *BackupInfo) error {
 		LogCritical("  2. Check disk space and file system integrity")
 		LogCritical("  3. Attempt manual restoration of the backup file")
 		return fmt.Errorf("failed to read backup file: %w - manual recovery may be required", err)
+	}
+
+	// Ensure target directory exists
+	targetDir := filepath.Dir(binaryPath)
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		LogCritical("Failed to create target directory: %v", err)
+		LogCritical("Target directory: %s", targetDir)
+		return fmt.Errorf("failed to create target directory: %w", err)
 	}
 
 	// Write to binary location
