@@ -2,6 +2,7 @@ package service
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 )
@@ -34,6 +35,9 @@ func (m *windowsManager) Uninstall(serviceName string) error {
 
 // Install creates the service using sc.exe create
 func (m *windowsManager) Install(serviceName, binaryPath string) error {
+	// Get the system PATH to include in service environment
+	systemPath := getSystemPATH()
+
 	// Create the service with sc.exe
 	// sc.exe create <serviceName> binPath= "<binaryPath>" start= auto
 	cmd := exec.Command("sc.exe", "create", serviceName,
@@ -44,6 +48,26 @@ func (m *windowsManager) Install(serviceName, binaryPath string) error {
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("failed to create service %s: %w, output: %s", serviceName, err, string(output))
+	}
+
+	// Configure service environment to include system PATH
+	// This ensures the service can find GCC and other system tools
+	if systemPath != "" {
+		// Use reg.exe to set the Environment value for the service
+		// This makes PATH available to the service process
+		regKey := fmt.Sprintf("HKLM\\SYSTEM\\CurrentControlSet\\Services\\%s", serviceName)
+		regCmd := exec.Command("reg.exe", "add", regKey,
+			"/v", "Environment",
+			"/t", "REG_MULTI_SZ",
+			"/d", fmt.Sprintf("PATH=%s", systemPath),
+			"/f",
+		)
+		if err := regCmd.Run(); err != nil {
+			// Log warning but don't fail installation
+			fmt.Printf("Warning: failed to set service environment PATH: %v\n", err)
+		} else {
+			fmt.Printf("Service environment configured with system PATH\n")
+		}
 	}
 
 	// Configure service to restart on failure
@@ -121,4 +145,35 @@ func (m *windowsManager) GetServiceBinaryPath(serviceName string) (string, error
 	}
 
 	return "", fmt.Errorf("BINARY_PATH_NAME not found for service %s", serviceName)
+}
+
+// getSystemPATH retrieves the system PATH from registry and current environment
+func getSystemPATH() string {
+	// Try to get the system PATH from registry first
+	cmd := exec.Command("reg.exe", "query",
+		"HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment",
+		"/v", "Path",
+	)
+	output, err := cmd.Output()
+	if err == nil {
+		// Parse the registry output
+		outputStr := string(output)
+		lines := strings.Split(outputStr, "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "Path") && strings.Contains(line, "REG_") {
+				// Line format: "Path    REG_EXPAND_SZ    C:\Windows\system32;..."
+				parts := strings.Fields(line)
+				if len(parts) >= 3 {
+					// Join everything after the type field
+					systemPath := strings.Join(parts[2:], " ")
+					return systemPath
+				}
+			}
+		}
+	}
+
+	// Fallback to current process PATH
+	// This includes both system and user PATH
+	return os.Getenv("PATH")
 }

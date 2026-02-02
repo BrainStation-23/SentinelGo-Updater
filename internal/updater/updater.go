@@ -864,17 +864,51 @@ func checkGCCInPath() bool {
 func checkGCCInCommonLocations() (string, error) {
 	LogInfo("Searching for GCC in common installation directories...")
 
+	// Get user profile directory for user-specific installations
+	userProfile := os.Getenv("USERPROFILE")
+
 	// Common GCC installation paths on Windows
 	commonPaths := []string{
+		// WinLibs installations
 		"C:\\Program Files\\WinLibs\\mingw64\\bin",
 		"C:\\Program Files\\WinLibs\\mingw32\\bin",
+		"C:\\Program Files (x86)\\WinLibs\\mingw64\\bin",
+		"C:\\Program Files (x86)\\WinLibs\\mingw32\\bin",
+
+		// MinGW installations
 		"C:\\MinGW\\bin",
 		"C:\\MinGW64\\bin",
+		"C:\\mingw64\\bin",
+		"C:\\mingw32\\bin",
+
+		// TDM-GCC
 		"C:\\TDM-GCC-64\\bin",
+		"C:\\TDM-GCC-32\\bin",
+
+		// MSYS2 installations
 		"C:\\msys64\\mingw64\\bin",
+		"C:\\msys64\\mingw32\\bin",
 		"C:\\msys64\\ucrt64\\bin",
+		"C:\\msys64\\clang64\\bin",
+		"C:\\msys32\\mingw64\\bin",
+		"C:\\msys32\\mingw32\\bin",
+
+		// mingw-w64 installations
 		"C:\\Program Files\\mingw-w64\\bin",
 		"C:\\Program Files (x86)\\mingw-w64\\bin",
+		"C:\\mingw-w64\\bin",
+	}
+
+	// Add user-specific paths if USERPROFILE is available
+	if userProfile != "" {
+		userPaths := []string{
+			filepath.Join(userProfile, "mingw64", "bin"),
+			filepath.Join(userProfile, "mingw32", "bin"),
+			filepath.Join(userProfile, ".mingw", "bin"),
+			filepath.Join(userProfile, "scoop", "apps", "mingw", "current", "bin"),
+			filepath.Join(userProfile, "scoop", "apps", "gcc", "current", "bin"),
+		}
+		commonPaths = append(commonPaths, userPaths...)
 	}
 
 	LogInfo("Checking %d common installation paths...", len(commonPaths))
