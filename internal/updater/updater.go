@@ -281,7 +281,13 @@ func getCommonInstallationPaths() []string {
 }
 
 func getLatestVersion() (string, error) {
-	cmd := exec.Command("go", "list", "-m", "-json", fmt.Sprintf("%s@latest", MainAgentModule))
+	goBinary, err := findGoBinary()
+	if err != nil {
+		return "", fmt.Errorf("go command not found: %w", err)
+	}
+	LogInfo("Using go binary: %s", goBinary)
+
+	cmd := exec.Command(goBinary, "list", "-m", "-json", fmt.Sprintf("%s@latest", MainAgentModule))
 	output, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("failed to query latest version: %w", err)
@@ -300,6 +306,44 @@ func getLatestVersion() (string, error) {
 	}
 
 	return moduleInfo.Version, nil
+}
+
+func findGoBinary() (string, error) {
+	if path, err := exec.LookPath("go"); err == nil {
+		return path, nil
+	}
+
+	commonPaths := []string{
+		"/usr/local/go/bin/go",
+		"/opt/homebrew/bin/go",
+		"/usr/local/bin/go",
+		"/opt/local/bin/go",
+	}
+
+	if home := os.Getenv("HOME"); home != "" {
+		commonPaths = append(commonPaths, filepath.Join(home, "go", "bin", "go"))
+		commonPaths = append(commonPaths, filepath.Join(home, ".go", "bin", "go"))
+	}
+
+	if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
+		if runtime.GOOS == "darwin" {
+			userHome := filepath.Join("/Users", sudoUser)
+			commonPaths = append(commonPaths, filepath.Join(userHome, "go", "bin", "go"))
+			commonPaths = append(commonPaths, filepath.Join(userHome, ".go", "bin", "go"))
+		} else {
+			userHome := filepath.Join("/home", sudoUser)
+			commonPaths = append(commonPaths, filepath.Join(userHome, "go", "bin", "go"))
+			commonPaths = append(commonPaths, filepath.Join(userHome, ".go", "bin", "go"))
+		}
+	}
+
+	for _, path := range commonPaths {
+		if _, err := os.Stat(path); err == nil {
+			return path, nil
+		}
+	}
+
+	return "", fmt.Errorf("go binary not found in PATH or common locations")
 }
 
 func isNewerVersion(current, latest string) bool {
@@ -502,6 +546,12 @@ func cleanupOldFiles() error {
 func downloadAndCompile(version string) (string, error) {
 	LogInfo("Setting up Go environment for compilation...")
 
+	goBinary, err := findGoBinary()
+	if err != nil {
+		return "", fmt.Errorf("go command not found: %w", err)
+	}
+	LogInfo("Using go binary: %s", goBinary)
+
 	gopath := os.Getenv("GOPATH")
 	if gopath == "" {
 		homeDir, err := ensureHomeDirectory()
@@ -514,7 +564,7 @@ func downloadAndCompile(version string) (string, error) {
 
 	goroot := os.Getenv("GOROOT")
 	if goroot == "" {
-		cmd := exec.Command("go", "env", "GOROOT")
+		cmd := exec.Command(goBinary, "env", "GOROOT")
 		output, err := cmd.Output()
 		if err == nil {
 			goroot = strings.TrimSpace(string(output))
@@ -553,9 +603,9 @@ func downloadAndCompile(version string) (string, error) {
 	LogInfo("  GOMODCACHE=%s", gomodcache)
 
 	moduleWithVersion := fmt.Sprintf("%s/cmd/sentinel@%s", MainAgentModule, version)
-	LogInfo("Executing: go install %s", moduleWithVersion)
+	LogInfo("Executing: %s install %s", goBinary, moduleWithVersion)
 
-	cmd := exec.Command("go", "install", moduleWithVersion)
+	cmd := exec.Command(goBinary, "install", moduleWithVersion)
 	cmd.Env = env
 
 	output, err := cmd.CombinedOutput()
