@@ -174,8 +174,16 @@ func getInstalledVersion() (string, error) {
 
 // getLatestVersion queries the Go module system for the latest version
 func getLatestVersion() (string, error) {
+	// Find the go binary
+	goBinary, err := findGoBinary()
+	if err != nil {
+		return "", fmt.Errorf("go command not found: %w", err)
+	}
+
+	LogInfo("Using go binary: %s", goBinary)
+
 	// Use 'go list -m -json' to get the latest version
-	cmd := exec.Command("go", "list", "-m", "-json", fmt.Sprintf("%s@latest", MainAgentModule))
+	cmd := exec.Command(goBinary, "list", "-m", "-json", fmt.Sprintf("%s@latest", MainAgentModule))
 
 	output, err := cmd.Output()
 	if err != nil {
@@ -196,6 +204,43 @@ func getLatestVersion() (string, error) {
 	}
 
 	return moduleInfo.Version, nil
+}
+
+// findGoBinary locates the go binary in common locations
+func findGoBinary() (string, error) {
+	// Try exec.LookPath first (checks PATH)
+	if path, err := exec.LookPath("go"); err == nil {
+		return path, nil
+	}
+
+	// Common Go installation paths
+	commonPaths := []string{
+		"/usr/local/go/bin/go",
+		"/opt/homebrew/bin/go",
+		"/usr/local/bin/go",
+		"/opt/local/bin/go",
+	}
+
+	// Also check user's home directory
+	if home := os.Getenv("HOME"); home != "" {
+		commonPaths = append(commonPaths, filepath.Join(home, "go", "bin", "go"))
+		commonPaths = append(commonPaths, filepath.Join(home, ".go", "bin", "go"))
+	}
+
+	// Check SUDO_USER's home
+	if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
+		userHome := filepath.Join("/Users", sudoUser)
+		commonPaths = append(commonPaths, filepath.Join(userHome, "go", "bin", "go"))
+		commonPaths = append(commonPaths, filepath.Join(userHome, ".go", "bin", "go"))
+	}
+
+	for _, path := range commonPaths {
+		if _, err := os.Stat(path); err == nil {
+			return path, nil
+		}
+	}
+
+	return "", fmt.Errorf("go binary not found in PATH or common locations")
 }
 
 // isNewerVersion compares two semantic versions and returns true if latest is newer
@@ -417,6 +462,13 @@ func cleanupOldFiles() error {
 func downloadAndCompile(version string) (string, error) {
 	LogInfo("Setting up Go environment for compilation...")
 
+	// Find the go binary
+	goBinary, err := findGoBinary()
+	if err != nil {
+		return "", fmt.Errorf("go command not found: %w", err)
+	}
+	LogInfo("Using go binary: %s", goBinary)
+
 	// Setup Go environment variables
 	gopath := os.Getenv("GOPATH")
 	if gopath == "" {
@@ -431,7 +483,7 @@ func downloadAndCompile(version string) (string, error) {
 	goroot := os.Getenv("GOROOT")
 	if goroot == "" {
 		// Try to detect GOROOT
-		cmd := exec.Command("go", "env", "GOROOT")
+		cmd := exec.Command(goBinary, "env", "GOROOT")
 		output, err := cmd.Output()
 		if err == nil {
 			goroot = strings.TrimSpace(string(output))
@@ -489,9 +541,9 @@ func downloadAndCompile(version string) (string, error) {
 
 	// Execute go install command
 	moduleWithVersion := fmt.Sprintf("%s/cmd/sentinel@%s", MainAgentModule, version)
-	LogInfo("Executing: go install %s", moduleWithVersion)
+	LogInfo("Executing: %s install %s", goBinary, moduleWithVersion)
 
-	cmd := exec.Command("go", "install", moduleWithVersion)
+	cmd := exec.Command(goBinary, "install", moduleWithVersion)
 	cmd.Env = env
 
 	// Capture both stdout and stderr
@@ -686,26 +738,49 @@ func createBackup(currentVersion string) (*BackupInfo, error) {
 	if _, err := os.Stat(binaryPath); os.IsNotExist(err) {
 		// On macOS/Linux, also check user's GOPATH/bin as fallback
 		if runtime.GOOS == "darwin" || runtime.GOOS == "linux" {
-			gopath := os.Getenv("GOPATH")
-			if gopath == "" {
-				homeDir, err := os.UserHomeDir()
-				if err == nil {
-					gopath = filepath.Join(homeDir, "go")
+			// Try to find the binary in common user locations (same logic as getInstalledVersion)
+			var possiblePaths []string
+
+			if gopath := os.Getenv("GOPATH"); gopath != "" {
+				possiblePaths = append(possiblePaths, filepath.Join(gopath, "bin", "sentinel"))
+			}
+
+			if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
+				userHome := filepath.Join("/Users", sudoUser)
+				possiblePaths = append(possiblePaths, filepath.Join(userHome, "go", "bin", "sentinel"))
+			}
+
+			if home := os.Getenv("HOME"); home != "" {
+				possiblePaths = append(possiblePaths, filepath.Join(home, "go", "bin", "sentinel"))
+			}
+
+			if homeDir, err := os.UserHomeDir(); err == nil {
+				possiblePaths = append(possiblePaths, filepath.Join(homeDir, "go", "bin", "sentinel"))
+			}
+
+			if runtime.GOOS == "darwin" {
+				usersDir := "/Users"
+				if entries, err := os.ReadDir(usersDir); err == nil {
+					for _, entry := range entries {
+						if entry.IsDir() && entry.Name() != "Shared" && entry.Name() != "Guest" {
+							possiblePaths = append(possiblePaths, filepath.Join(usersDir, entry.Name(), "go", "bin", "sentinel"))
+						}
+					}
 				}
 			}
 
-			if gopath != "" {
-				binaryName := "sentinel"
-				gopathBinary := filepath.Join(gopath, "bin", binaryName)
-
-				if _, err := os.Stat(gopathBinary); err == nil {
-					LogInfo("Found binary in GOPATH for backup: %s", gopathBinary)
-					binaryPath = gopathBinary
-				} else {
-					return nil, fmt.Errorf("current binary not found at %s or %s", binaryPath, gopathBinary)
+			// Try each possible path
+			for _, path := range possiblePaths {
+				if _, err := os.Stat(path); err == nil {
+					LogInfo("Found binary for backup at: %s", path)
+					binaryPath = path
+					break
 				}
-			} else {
-				return nil, fmt.Errorf("current binary not found at %s", binaryPath)
+			}
+
+			// If still not found, return error
+			if binaryPath == paths.GetMainAgentBinaryPath() {
+				return nil, fmt.Errorf("current binary not found at %s or any user GOPATH location", binaryPath)
 			}
 		} else {
 			return nil, fmt.Errorf("current binary not found at %s", binaryPath)
