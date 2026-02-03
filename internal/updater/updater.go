@@ -96,39 +96,10 @@ func getInstalledVersion() (string, error) {
 	// Check if binary exists at system location
 	if _, err := os.Stat(binaryPath); os.IsNotExist(err) {
 		LogInfo("Binary not found at system location, checking GOPATH...")
-		// On macOS/Linux, also check user's GOPATH/bin as fallback
-		if runtime.GOOS == "darwin" || runtime.GOOS == "linux" {
-			// Try to find the binary in common user locations
-			var possiblePaths []string
-
-			// Method 1: Check GOPATH environment variable
-			if gopath := os.Getenv("GOPATH"); gopath != "" {
-				possiblePaths = append(possiblePaths, filepath.Join(gopath, "bin", "sentinel"))
-			}
-
-			// Method 2: Check SUDO_USER's home directory (cross-platform)
-			if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
-				var userHome string
-				switch runtime.GOOS {
-				case "darwin":
-					userHome = filepath.Join("/Users", sudoUser)
-				case "linux":
-					userHome = filepath.Join("/home", sudoUser)
-				}
-				if userHome != "" {
-					possiblePaths = append(possiblePaths, filepath.Join(userHome, "go", "bin", "sentinel"))
-				}
-			}
-
-			// Method 3: Check current HOME
-			if home := os.Getenv("HOME"); home != "" {
-				possiblePaths = append(possiblePaths, filepath.Join(home, "go", "bin", "sentinel"))
-			}
-
-			// Method 4: Try os.UserHomeDir()
-			if homeDir, err := os.UserHomeDir(); err == nil {
-				possiblePaths = append(possiblePaths, filepath.Join(homeDir, "go", "bin", "sentinel"))
-			}
+		// On macOS/Linux/Windows, also check user's GOPATH/bin as fallback
+		if runtime.GOOS == "darwin" || runtime.GOOS == "linux" || runtime.GOOS == "windows" {
+			// Use platform-specific function to get possible paths
+			possiblePaths := getPossibleBinaryPaths()
 
 			// Try each possible path
 			LogInfo("Checking %d possible locations for sentinel binary", len(possiblePaths))
@@ -461,7 +432,7 @@ func downloadAndCompile(version string) (string, error) {
 	// Setup Go environment variables
 	gopath := os.Getenv("GOPATH")
 	if gopath == "" {
-		homeDir, err := os.UserHomeDir()
+		homeDir, err := ensureHomeDirectory()
 		if err != nil {
 			return "", fmt.Errorf("failed to get home directory: %w", err)
 		}
@@ -726,34 +697,9 @@ func createBackup(currentVersion string) (*BackupInfo, error) {
 	// Check if current binary exists at system location
 	if _, err := os.Stat(binaryPath); os.IsNotExist(err) {
 		// On macOS/Linux, also check user's GOPATH/bin as fallback
-		if runtime.GOOS == "darwin" || runtime.GOOS == "linux" {
-			// Try to find the binary in common user locations (same logic as getInstalledVersion)
-			var possiblePaths []string
-
-			if gopath := os.Getenv("GOPATH"); gopath != "" {
-				possiblePaths = append(possiblePaths, filepath.Join(gopath, "bin", "sentinel"))
-			}
-
-			if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
-				var userHome string
-				switch runtime.GOOS {
-				case "darwin":
-					userHome = filepath.Join("/Users", sudoUser)
-				case "linux":
-					userHome = filepath.Join("/home", sudoUser)
-				}
-				if userHome != "" {
-					possiblePaths = append(possiblePaths, filepath.Join(userHome, "go", "bin", "sentinel"))
-				}
-			}
-
-			if home := os.Getenv("HOME"); home != "" {
-				possiblePaths = append(possiblePaths, filepath.Join(home, "go", "bin", "sentinel"))
-			}
-
-			if homeDir, err := os.UserHomeDir(); err == nil {
-				possiblePaths = append(possiblePaths, filepath.Join(homeDir, "go", "bin", "sentinel"))
-			}
+		if runtime.GOOS == "darwin" || runtime.GOOS == "linux" || runtime.GOOS == "windows" {
+			// Use platform-specific function to get possible paths
+			possiblePaths := getPossibleBinaryPaths()
 
 			// Try each possible path
 			for _, path := range possiblePaths {
