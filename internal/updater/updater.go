@@ -98,54 +98,57 @@ func getInstalledVersion() (string, error) {
 		LogInfo("Binary not found at system location, checking GOPATH...")
 		// On macOS/Linux, also check user's GOPATH/bin as fallback
 		if runtime.GOOS == "darwin" || runtime.GOOS == "linux" {
-			gopath := os.Getenv("GOPATH")
-			LogInfo("GOPATH from environment: %s", gopath)
-			if gopath == "" {
-				// Try multiple methods to get home directory
-				homeDir := os.Getenv("HOME")
-				if homeDir == "" {
-					// If running as sudo, try to get the original user's home
-					if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
-						LogInfo("Running as sudo, SUDO_USER: %s", sudoUser)
-						homeDir = filepath.Join("/Users", sudoUser)
-						LogInfo("Using home directory: %s", homeDir)
-					} else {
-						// Fallback to os.UserHomeDir()
-						var err error
-						homeDir, err = os.UserHomeDir()
-						if err != nil {
-							LogError("Failed to get home directory: %v", err)
-						} else {
-							LogInfo("Got home directory from os.UserHomeDir: %s", homeDir)
+			// Try to find the binary in common user locations
+			var possiblePaths []string
+
+			// Method 1: Check GOPATH environment variable
+			if gopath := os.Getenv("GOPATH"); gopath != "" {
+				possiblePaths = append(possiblePaths, filepath.Join(gopath, "bin", "sentinel"))
+			}
+
+			// Method 2: Check SUDO_USER's home directory
+			if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
+				userHome := filepath.Join("/Users", sudoUser)
+				possiblePaths = append(possiblePaths, filepath.Join(userHome, "go", "bin", "sentinel"))
+			}
+
+			// Method 3: Check current HOME
+			if home := os.Getenv("HOME"); home != "" {
+				possiblePaths = append(possiblePaths, filepath.Join(home, "go", "bin", "sentinel"))
+			}
+
+			// Method 4: Try os.UserHomeDir()
+			if homeDir, err := os.UserHomeDir(); err == nil {
+				possiblePaths = append(possiblePaths, filepath.Join(homeDir, "go", "bin", "sentinel"))
+			}
+
+			// Method 5: Common macOS user paths
+			if runtime.GOOS == "darwin" {
+				// Try to find any user's go/bin/sentinel
+				usersDir := "/Users"
+				if entries, err := os.ReadDir(usersDir); err == nil {
+					for _, entry := range entries {
+						if entry.IsDir() && entry.Name() != "Shared" && entry.Name() != "Guest" {
+							possiblePaths = append(possiblePaths, filepath.Join(usersDir, entry.Name(), "go", "bin", "sentinel"))
 						}
 					}
-				} else {
-					LogInfo("Got home directory from HOME env: %s", homeDir)
-				}
-
-				if homeDir != "" {
-					gopath = filepath.Join(homeDir, "go")
-					LogInfo("GOPATH not set, using default: %s", gopath)
 				}
 			}
 
-			if gopath != "" {
-				binaryName := "sentinel"
-				if runtime.GOOS == "windows" {
-					binaryName = "sentinel.exe"
+			// Try each possible path
+			LogInfo("Checking %d possible locations for sentinel binary", len(possiblePaths))
+			for _, path := range possiblePaths {
+				LogInfo("Checking: %s", path)
+				if _, err := os.Stat(path); err == nil {
+					LogInfo("Found binary at: %s", path)
+					binaryPath = path
+					break
 				}
-				gopathBinary := filepath.Join(gopath, "bin", binaryName)
-				LogInfo("Checking GOPATH binary location: %s", gopathBinary)
+			}
 
-				if _, err := os.Stat(gopathBinary); err == nil {
-					LogInfo("Found binary in GOPATH: %s", gopathBinary)
-					binaryPath = gopathBinary
-				} else {
-					LogError("Binary not found at GOPATH location either: %v", err)
-					return "", fmt.Errorf("main agent binary not found at %s or %s", binaryPath, gopathBinary)
-				}
-			} else {
-				return "", fmt.Errorf("main agent binary not found at %s", binaryPath)
+			// If still not found, return error
+			if binaryPath == paths.GetMainAgentBinaryPath() {
+				return "", fmt.Errorf("main agent binary not found at %s or any user GOPATH location", binaryPath)
 			}
 		} else {
 			return "", fmt.Errorf("main agent binary not found at %s", binaryPath)
