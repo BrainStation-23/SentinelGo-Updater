@@ -4,7 +4,6 @@
 package updater
 
 import (
-	"fmt"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -38,6 +37,7 @@ func ensureHomeDirectory() (string, error) {
 	}
 
 	// Strategy 5: Scan /Users directory for any user (macOS-specific fallback)
+	LogInfo("Scanning /Users directory for available users...")
 	usersDir := "/Users"
 	if entries, err := os.ReadDir(usersDir); err == nil {
 		for _, entry := range entries {
@@ -49,8 +49,9 @@ func ensureHomeDirectory() (string, error) {
 		}
 	}
 
-	// All strategies failed
-	return "", fmt.Errorf("unable to determine home directory: all detection strategies failed")
+	// Strategy 6: Use /tmp as absolute last resort
+	LogWarning("Could not determine home directory, using /tmp as fallback")
+	return "/tmp", nil
 }
 
 // getPossibleBinaryPaths returns platform-specific possible paths for the sentinel binary

@@ -16,13 +16,8 @@ import (
 )
 
 const (
-	// CheckInterval is the time between version checks
-	CheckInterval = 30 * time.Second
-
-	// MainAgentModule is the Go module path for the main agent
-	MainAgentModule = "github.com/BrainStation-23/SentinelGo"
-
-	// MainAgentServiceName is the service name for the main agent
+	CheckInterval        = 30 * time.Second
+	MainAgentModule      = "github.com/BrainStation-23/SentinelGo"
 	MainAgentServiceName = "sentinelgo"
 )
 
@@ -34,9 +29,45 @@ func init() {
 	serviceManager = service.NewManager()
 }
 
-// Run is the main updater loop that checks for updates every CheckInterval
+// setEnvironmentVariables ensures required environment variables are set for child processes
+func setEnvironmentVariables() error {
+	LogInfo("Setting up environment variables for update process...")
+
+	// Ensure $HOME is set using platform-specific function
+	homeDir, err := ensureHomeDirectory()
+	if err != nil {
+		LogError("Failed to determine home directory: %v", err)
+		return fmt.Errorf("failed to determine home directory: %w", err)
+	}
+
+	// Set $HOME if not already set
+	if os.Getenv("HOME") == "" {
+		if err := os.Setenv("HOME", homeDir); err != nil {
+			LogError("Failed to set $HOME environment variable: %v", err)
+			return fmt.Errorf("failed to set $HOME: %w", err)
+		}
+		LogInfo("Set $HOME environment variable to: %s", homeDir)
+	} else {
+		LogInfo("$HOME environment variable already set to: %s", os.Getenv("HOME"))
+	}
+
+	// Set $GOPATH if not already set (default to $HOME/go)
+	if os.Getenv("GOPATH") == "" {
+		gopath := filepath.Join(homeDir, "go")
+		if err := os.Setenv("GOPATH", gopath); err != nil {
+			LogError("Failed to set $GOPATH environment variable: %v", err)
+			return fmt.Errorf("failed to set $GOPATH: %w", err)
+		}
+		LogInfo("Set $GOPATH environment variable to: %s", gopath)
+	} else {
+		LogInfo("$GOPATH environment variable already set to: %s", os.Getenv("GOPATH"))
+	}
+
+	LogInfo("Environment variables configured successfully")
+	return nil
+}
+
 func Run() {
-	// Initialize logging system
 	if err := InitLogger(); err != nil {
 		log.Fatalf("Failed to initialize logging system: %v", err)
 	}
@@ -52,6 +83,7 @@ func Run() {
 		currentVersion, err := getInstalledVersion()
 		if err != nil {
 			LogError("Failed to get installed version: %v", err)
+			LogInfo("This is a transient error - detection will be retried automatically")
 			LogInfo("Will retry in %v", CheckInterval)
 			time.Sleep(CheckInterval)
 			continue
@@ -88,75 +120,164 @@ func Run() {
 	}
 }
 
-// getInstalledVersion reads the current main agent version
 func getInstalledVersion() (string, error) {
-	binaryPath := paths.GetMainAgentBinaryPath()
-	LogInfo("Checking for binary at system location: %s", binaryPath)
-
-	// Check if binary exists at system location
-	if _, err := os.Stat(binaryPath); os.IsNotExist(err) {
-		LogInfo("Binary not found at system location, checking GOPATH...")
-		// On macOS/Linux/Windows, also check user's GOPATH/bin as fallback
-		if runtime.GOOS == "darwin" || runtime.GOOS == "linux" || runtime.GOOS == "windows" {
-			// Use platform-specific function to get possible paths
-			possiblePaths := getPossibleBinaryPaths()
-
-			// Try each possible path
-			LogInfo("Checking %d possible locations for sentinel binary", len(possiblePaths))
-			for _, path := range possiblePaths {
-				LogInfo("Checking: %s", path)
-				if _, err := os.Stat(path); err == nil {
-					LogInfo("Found binary at: %s", path)
-					binaryPath = path
-					break
-				}
-			}
-
-			// If still not found, return error
-			if binaryPath == paths.GetMainAgentBinaryPath() {
-				return "", fmt.Errorf("main agent binary not found at %s or any user GOPATH location", binaryPath)
-			}
-		} else {
-			return "", fmt.Errorf("main agent binary not found at %s", binaryPath)
-		}
-	} else {
-		LogInfo("Found binary at system location: %s", binaryPath)
+	binaryPath, detectionMethod, err := getMainAgentBinaryPathWithDetails()
+	if err != nil {
+		LogError("Failed to detect binary path: %v", err)
+		LogWarning("Will retry detection on next update check")
+		LogInfo("Detection will be retried in %v", CheckInterval)
+		return "", fmt.Errorf("binary path detection failed: %w", err)
 	}
 
-	// Execute the binary with --version flag
+	LogInfo("Binary path successfully detected using method: %s", detectionMethod)
+	LogInfo("Using binary at: %s", binaryPath)
+
+	if _, err := os.Stat(binaryPath); os.IsNotExist(err) {
+		LogError("Binary not found at detected path: %s", binaryPath)
+		LogWarning("Will retry on next check")
+		return "", fmt.Errorf("main agent binary not found at %s", binaryPath)
+	}
+
 	cmd := exec.Command(binaryPath, "--version")
 	output, err := cmd.Output()
 	if err != nil {
+		LogError("Failed to get version from binary at %s: %v", binaryPath, err)
+		LogWarning("Binary may be corrupted or incompatible")
+		LogWarning("Will retry on next check")
 		return "", fmt.Errorf("failed to get version from binary: %w", err)
 	}
 
 	version := strings.TrimSpace(string(output))
 	if version == "" {
+		LogError("Binary at %s returned empty version", binaryPath)
+		LogWarning("This may indicate an incompatible or corrupted binary")
 		return "", fmt.Errorf("binary returned empty version")
 	}
 
+	versionParts := strings.Fields(version)
+	for _, part := range versionParts {
+		if len(part) > 1 && part[0] == 'v' && part[1] >= '0' && part[1] <= '9' {
+			return part, nil
+		}
+	}
+
+	LogWarning("Could not extract version number from output: %s", version)
 	return version, nil
 }
 
-// getLatestVersion queries the Go module system for the latest version
-func getLatestVersion() (string, error) {
-	// Find the go binary
-	goBinary, err := findGoBinary()
-	if err != nil {
-		return "", fmt.Errorf("go command not found: %w", err)
+func getMainAgentBinaryPathWithDetails() (path string, method string, err error) {
+	// Try to get binary path from paths package
+	detectedPath := paths.GetMainAgentBinaryPath()
+
+	// Check if binary exists at system location
+	if _, err := os.Stat(detectedPath); err == nil {
+		method = inferDetectionMethod(detectedPath)
+		return detectedPath, method, nil
 	}
 
-	LogInfo("Using go binary: %s", goBinary)
+	// If not found at system location, try platform-specific paths
+	possiblePaths := getPossibleBinaryPaths()
+	for _, path := range possiblePaths {
+		if _, err := os.Stat(path); err == nil {
+			method = "user_gopath_location"
+			return path, method, nil
+		}
+	}
 
-	// Use 'go list -m -json' to get the latest version
-	cmd := exec.Command(goBinary, "list", "-m", "-json", fmt.Sprintf("%s@latest", MainAgentModule))
+	return "", "", fmt.Errorf("binary not found at %s or any fallback location", detectedPath)
+}
 
+func inferDetectionMethod(detectedPath string) string {
+	configPath := filepath.Join(paths.GetDataDirectory(), "updater-config.json")
+	if _, err := os.Stat(configPath); err == nil {
+		return "manual_configuration"
+	}
+
+	pathEnv := os.Getenv("PATH")
+	if pathEnv != "" {
+		separator := ":"
+		if runtime.GOOS == "windows" {
+			separator = ";"
+		}
+		pathDirs := strings.Split(pathEnv, separator)
+		detectedDir := filepath.Dir(detectedPath)
+		for _, dir := range pathDirs {
+			if dir == detectedDir {
+				return "path_environment_variable"
+			}
+		}
+	}
+
+	commonPaths := getCommonInstallationPaths()
+	for _, commonPath := range commonPaths {
+		if detectedPath == commonPath {
+			return "common_installation_directory"
+		}
+	}
+
+	switch runtime.GOOS {
+	case "linux":
+		if strings.Contains(detectedPath, "/systemd/") || strings.Contains(detectedPath, "/lib/") {
+			return "systemd_service_configuration"
+		}
+	case "darwin":
+		if strings.Contains(detectedPath, "/Library/") || strings.Contains(detectedPath, "/LaunchDaemons/") {
+			return "launchd_service_configuration"
+		}
+	case "windows":
+		if strings.Contains(detectedPath, "Program Files") || strings.Contains(detectedPath, "ProgramData") {
+			return "windows_service_configuration"
+		}
+	}
+
+	return "auto_detection"
+}
+
+func getCommonInstallationPaths() []string {
+	binaryName := "sentinel"
+	if runtime.GOOS == "windows" {
+		binaryName = "sentinel.exe"
+	}
+
+	switch runtime.GOOS {
+	case "linux":
+		return []string{
+			"/usr/local/bin/" + binaryName,
+			"/usr/bin/" + binaryName,
+			"/opt/sentinelgo/" + binaryName,
+			filepath.Join(os.Getenv("HOME"), "go/bin", binaryName),
+			filepath.Join(os.Getenv("HOME"), ".local/bin", binaryName),
+		}
+	case "darwin":
+		return []string{
+			"/usr/local/bin/" + binaryName,
+			"/usr/bin/" + binaryName,
+			"/opt/sentinelgo/" + binaryName,
+			filepath.Join(os.Getenv("HOME"), "go/bin", binaryName),
+			"/Applications/SentinelGo/" + binaryName,
+		}
+	case "windows":
+		return []string{
+			filepath.Join(os.Getenv("ProgramFiles"), "SentinelGo", binaryName),
+			filepath.Join(os.Getenv("ProgramFiles(x86)"), "SentinelGo", binaryName),
+			filepath.Join(os.Getenv("USERPROFILE"), "go", "bin", binaryName),
+			"C:\\SentinelGo\\" + binaryName,
+		}
+	default:
+		return []string{
+			"/usr/local/bin/" + binaryName,
+			"/usr/bin/" + binaryName,
+		}
+	}
+}
+
+func getLatestVersion() (string, error) {
+	cmd := exec.Command("go", "list", "-m", "-json", fmt.Sprintf("%s@latest", MainAgentModule))
 	output, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("failed to query latest version: %w", err)
 	}
 
-	// Parse JSON output
 	var moduleInfo struct {
 		Version string `json:"Version"`
 	}
@@ -172,59 +293,17 @@ func getLatestVersion() (string, error) {
 	return moduleInfo.Version, nil
 }
 
-// findGoBinary locates the go binary in common locations
-func findGoBinary() (string, error) {
-	// Try exec.LookPath first (checks PATH)
-	if path, err := exec.LookPath("go"); err == nil {
-		return path, nil
-	}
-
-	// Common Go installation paths
-	commonPaths := []string{
-		"/usr/local/go/bin/go",
-		"/opt/homebrew/bin/go",
-		"/usr/local/bin/go",
-		"/opt/local/bin/go",
-	}
-
-	// Also check user's home directory
-	if home := os.Getenv("HOME"); home != "" {
-		commonPaths = append(commonPaths, filepath.Join(home, "go", "bin", "go"))
-		commonPaths = append(commonPaths, filepath.Join(home, ".go", "bin", "go"))
-	}
-
-	// Check SUDO_USER's home
-	if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
-		userHome := filepath.Join("/Users", sudoUser)
-		commonPaths = append(commonPaths, filepath.Join(userHome, "go", "bin", "go"))
-		commonPaths = append(commonPaths, filepath.Join(userHome, ".go", "bin", "go"))
-	}
-
-	for _, path := range commonPaths {
-		if _, err := os.Stat(path); err == nil {
-			return path, nil
-		}
-	}
-
-	return "", fmt.Errorf("go binary not found in PATH or common locations")
-}
-
-// isNewerVersion compares two semantic versions and returns true if latest is newer
 func isNewerVersion(current, latest string) bool {
-	// Remove 'v' prefix if present
 	current = strings.TrimPrefix(current, "v")
 	latest = strings.TrimPrefix(latest, "v")
 
-	// If versions are identical, no update needed
 	if current == latest {
 		return false
 	}
 
-	// Parse versions
 	currentParts := parseVersion(current)
 	latestParts := parseVersion(latest)
 
-	// Compare major, minor, patch
 	for i := 0; i < 3; i++ {
 		if latestParts[i] > currentParts[i] {
 			return true
@@ -237,77 +316,64 @@ func isNewerVersion(current, latest string) bool {
 	return false
 }
 
-// parseVersion parses a semantic version string into [major, minor, patch]
 func parseVersion(version string) [3]int {
 	var parts [3]int
-
-	// Split by '.' and parse each part
 	segments := strings.Split(version, ".")
 	for i := 0; i < len(segments) && i < 3; i++ {
-		// Parse the number, ignoring any non-numeric suffixes
 		var num int
 		fmt.Sscanf(segments[i], "%d", &num)
 		parts[i] = num
 	}
-
 	return parts
 }
 
-// performUpdate executes the complete update cycle with rollback support
 func performUpdate(targetVersion string) error {
 	LogInfo("=== Starting update to %s ===", targetVersion)
 
-	// Get current version before any changes
+	LogInfo("Setting up environment for update...")
+	if err := setEnvironmentVariables(); err != nil {
+		LogError("Environment setup failed: %v", err)
+		return fmt.Errorf("failed to set up environment: %w", err)
+	}
+	LogInfo("Environment setup completed successfully")
+
 	currentVersion, err := getInstalledVersion()
 	if err != nil {
 		LogWarning("Could not get current version: %v", err)
+		LogWarning("This may indicate the binary is not properly installed")
 		currentVersion = "unknown"
+		if currentVersion == "unknown" {
+			LogError("Cannot proceed with update - current binary not detected")
+			LogError("Please ensure sentinel is properly installed before updating")
+			return fmt.Errorf("cannot update: current binary not detected: %w", err)
+		}
 	}
 
-	// Create backup before any changes
 	LogInfo("Creating backup before update...")
 	backup, err := createBackup(currentVersion)
 	if err != nil {
 		return fmt.Errorf("failed to create backup: %w", err)
 	}
-	// Ensure backup is cleaned up on success
-	defer func() {
-		if backup != nil && backup.BackupPath != "" {
-			// Only remove backup if update was successful (no panic/error)
-			if r := recover(); r == nil {
-				LogInfo("Cleaning up backup file: %s", backup.BackupPath)
-				if err := os.Remove(backup.BackupPath); err != nil && !os.IsNotExist(err) {
-					LogWarning("Failed to remove backup file: %v", err)
-				}
-			}
-		}
-	}()
 
-	// Wrap update steps in error handling with rollback
 	updateErr := func() error {
-		// Step 1: Stop the main agent service
 		LogInfo("Step 1: Stopping main agent service...")
 		if err := serviceManager.Stop(MainAgentServiceName); err != nil {
 			return fmt.Errorf("failed to stop main agent: %w", err)
 		}
 		LogInfo("Main agent service stopped successfully")
 
-		// Step 2: Uninstall the main agent service
 		LogInfo("Step 2: Uninstalling main agent service...")
 		if err := serviceManager.Uninstall(MainAgentServiceName); err != nil {
 			return fmt.Errorf("failed to uninstall main agent: %w", err)
 		}
 		LogInfo("Main agent service uninstalled successfully")
 
-		// Step 3: Clean up old files (except database)
 		LogInfo("Step 3: Cleaning up old files...")
 		if err := cleanupOldFiles(); err != nil {
 			LogWarning("Cleanup failed: %v", err)
-			// Continue anyway, this is not critical
 		}
 		LogInfo("Cleanup completed")
 
-		// Step 4: Download and compile new version
 		LogInfo("Step 4: Downloading and compiling version %s...", targetVersion)
 		newBinaryPath, err := downloadAndCompile(targetVersion)
 		if err != nil {
@@ -315,29 +381,34 @@ func performUpdate(targetVersion string) error {
 		}
 		LogInfo("Compilation successful, binary at: %s", newBinaryPath)
 
-		// Step 5: Install new binary
 		LogInfo("Step 5: Installing new binary...")
 		if err := installBinary(newBinaryPath); err != nil {
 			return fmt.Errorf("failed to install binary: %w", err)
 		}
 		LogInfo("Binary installed successfully")
 
-		// Step 6: Reinstall service
 		LogInfo("Step 6: Reinstalling main agent service...")
-		installedBinaryPath := paths.GetMainAgentBinaryPath()
+		installedBinaryPath, detectionMethod, detectErr := getMainAgentBinaryPathWithDetails()
+		if detectErr != nil {
+			LogError("Failed to detect newly installed binary: %v", detectErr)
+			installedBinaryPath = paths.GetMainAgentBinaryPath()
+			LogWarning("Using fallback path detection: %s", installedBinaryPath)
+		} else {
+			LogInfo("Newly installed binary detected using method: %s", detectionMethod)
+			LogInfo("Binary path: %s", installedBinaryPath)
+		}
+
 		if err := serviceManager.Install(MainAgentServiceName, installedBinaryPath); err != nil {
 			return fmt.Errorf("failed to install service: %w", err)
 		}
 		LogInfo("Service reinstalled successfully")
 
-		// Step 7: Start service
 		LogInfo("Step 7: Starting main agent service...")
 		if err := serviceManager.Start(MainAgentServiceName); err != nil {
 			return fmt.Errorf("failed to start service: %w", err)
 		}
 		LogInfo("Service started successfully")
 
-		// Step 8: Verify service is running
 		LogInfo("Step 8: Verifying main agent is running...")
 		if err := verifyMainAgentRunning(); err != nil {
 			LogError("Service verification failed: %v", err)
@@ -348,7 +419,6 @@ func performUpdate(targetVersion string) error {
 		return nil
 	}()
 
-	// If update failed, trigger rollback
 	if updateErr != nil {
 		LogError("Update failed: %v", updateErr)
 		LogInfo("Triggering rollback to previous version...")
@@ -362,15 +432,19 @@ func performUpdate(targetVersion string) error {
 		return fmt.Errorf("update failed, rolled back to version %s: %w", backup.Version, updateErr)
 	}
 
+	LogInfo("Update completed successfully, cleaning up backup file...")
+	if err := cleanupBackupFile(backup.BackupPath); err != nil {
+		LogWarning("Failed to clean up backup file: %v", err)
+		LogWarning("Backup file may need to be manually deleted: %s", backup.BackupPath)
+	}
+
 	LogInfo("=== Update completed successfully ===")
 	return nil
 }
 
-// cleanupOldFiles removes old binary and backup files while preserving database and logs
 func cleanupOldFiles() error {
 	var errors []string
 
-	// Delete main agent binary
 	binaryPath := paths.GetMainAgentBinaryPath()
 	LogInfo("Deleting main agent binary: %s", binaryPath)
 	if err := os.Remove(binaryPath); err != nil && !os.IsNotExist(err) {
@@ -379,19 +453,25 @@ func cleanupOldFiles() error {
 		LogInfo("Deleted: %s", binaryPath)
 	}
 
-	// Delete old backup binary (.old) - but NOT .backup as it's used for rollback
 	backupOldPath := binaryPath + ".old"
-	LogInfo("Checking for old backup file: %s", backupOldPath)
+	LogInfo("Checking for legacy backup file: %s", backupOldPath)
 	if err := os.Remove(backupOldPath); err != nil && !os.IsNotExist(err) {
-		errors = append(errors, fmt.Sprintf("failed to delete backup %s: %v", backupOldPath, err))
+		errors = append(errors, fmt.Sprintf("failed to delete legacy backup %s: %v", backupOldPath, err))
 	} else if err == nil {
-		LogInfo("Deleted: %s", backupOldPath)
+		LogInfo("Deleted legacy backup: %s", backupOldPath)
+	} else if os.IsNotExist(err) {
+		LogInfo("No legacy backup file found (this is normal)")
 	}
 
-	// NOTE: We do NOT delete .backup file here as it's needed for rollback
-	// It will be cleaned up after successful update in the defer function
+	backupPath := binaryPath + ".backup"
+	LogInfo("Checking for current backup file: %s", backupPath)
+	if _, err := os.Stat(backupPath); err == nil {
+		LogInfo("Preserving backup file for potential rollback: %s", backupPath)
+	} else if os.IsNotExist(err) {
+		LogWarning("Backup file not found at: %s", backupPath)
+		LogWarning("Rollback will not be possible if update fails")
+	}
 
-	// Verify database is preserved
 	dbPath := paths.GetDatabasePath()
 	if _, err := os.Stat(dbPath); err == nil {
 		LogInfo("Database preserved at: %s", dbPath)
@@ -399,7 +479,6 @@ func cleanupOldFiles() error {
 		LogInfo("Database does not exist yet at: %s", dbPath)
 	}
 
-	// Verify log files are preserved
 	updaterLogPath := paths.GetUpdaterLogPath()
 	if _, err := os.Stat(updaterLogPath); err == nil {
 		LogInfo("Updater log preserved at: %s", updaterLogPath)
@@ -418,18 +497,9 @@ func cleanupOldFiles() error {
 	return nil
 }
 
-// downloadAndCompile downloads and compiles the specified version of the main agent
 func downloadAndCompile(version string) (string, error) {
 	LogInfo("Setting up Go environment for compilation...")
 
-	// Find the go binary
-	goBinary, err := findGoBinary()
-	if err != nil {
-		return "", fmt.Errorf("go command not found: %w", err)
-	}
-	LogInfo("Using go binary: %s", goBinary)
-
-	// Setup Go environment variables
 	gopath := os.Getenv("GOPATH")
 	if gopath == "" {
 		homeDir, err := ensureHomeDirectory()
@@ -442,8 +512,7 @@ func downloadAndCompile(version string) (string, error) {
 
 	goroot := os.Getenv("GOROOT")
 	if goroot == "" {
-		// Try to detect GOROOT
-		cmd := exec.Command(goBinary, "env", "GOROOT")
+		cmd := exec.Command("go", "env", "GOROOT")
 		output, err := cmd.Output()
 		if err == nil {
 			goroot = strings.TrimSpace(string(output))
@@ -463,9 +532,8 @@ func downloadAndCompile(version string) (string, error) {
 		LogInfo("GOMODCACHE not set, using: %s", gomodcache)
 	}
 
-	// Prepare environment variables
 	env := os.Environ()
-	env = append(env, "CGO_ENABLED=1") // Enable CGO for SQLite support
+	env = append(env, "CGO_ENABLED=1")
 	env = append(env, fmt.Sprintf("GOPATH=%s", gopath))
 	if goroot != "" {
 		env = append(env, fmt.Sprintf("GOROOT=%s", goroot))
@@ -482,34 +550,14 @@ func downloadAndCompile(version string) (string, error) {
 	LogInfo("  GOCACHE=%s", gocache)
 	LogInfo("  GOMODCACHE=%s", gomodcache)
 
-	// On Windows, locate and add GCC to PATH
-	if runtime.GOOS == "windows" {
-		LogInfo("Windows detected, checking for GCC...")
-		gccPath, err := findGCCOnWindows()
-		if err != nil {
-			LogWarning("GCC not found: %v", err)
-			LogWarning("CGO compilation may fail without GCC")
-		} else {
-			LogInfo("Found GCC at: %s", gccPath)
-			// Add GCC directory to PATH
-			pathEnv := os.Getenv("PATH")
-			newPath := fmt.Sprintf("%s%c%s", gccPath, os.PathListSeparator, pathEnv)
-			env = setEnvVar(env, "PATH", newPath)
-			LogInfo("Added GCC to PATH")
-		}
-	}
-
-	// Execute go install command
 	moduleWithVersion := fmt.Sprintf("%s/cmd/sentinel@%s", MainAgentModule, version)
-	LogInfo("Executing: %s install %s", goBinary, moduleWithVersion)
+	LogInfo("Executing: go install %s", moduleWithVersion)
 
-	cmd := exec.Command(goBinary, "install", moduleWithVersion)
+	cmd := exec.Command("go", "install", moduleWithVersion)
 	cmd.Env = env
 
-	// Capture both stdout and stderr
 	output, err := cmd.CombinedOutput()
 
-	// Log compilation output
 	if len(output) > 0 {
 		LogInfo("Compilation output:\n%s", string(output))
 	}
@@ -520,14 +568,12 @@ func downloadAndCompile(version string) (string, error) {
 		return "", fmt.Errorf("compilation failed: %w\nOutput: %s", err, string(output))
 	}
 
-	// Determine the path to the compiled binary
 	binaryName := "sentinel"
 	if runtime.GOOS == "windows" {
 		binaryName = "sentinel.exe"
 	}
 	compiledBinaryPath := filepath.Join(gopath, "bin", binaryName)
 
-	// Verify the binary exists
 	if _, err := os.Stat(compiledBinaryPath); os.IsNotExist(err) {
 		LogError("Compiled binary not found at expected location: %s", compiledBinaryPath)
 		return "", fmt.Errorf("compiled binary not found at expected location: %s", compiledBinaryPath)
@@ -537,105 +583,47 @@ func downloadAndCompile(version string) (string, error) {
 	return compiledBinaryPath, nil
 }
 
-// findGCCOnWindows attempts to locate GCC on Windows systems
-func findGCCOnWindows() (string, error) {
-	// Common GCC installation paths on Windows
-	commonPaths := []string{
-		"C:\\MinGW\\bin",
-		"C:\\MinGW64\\bin",
-		"C:\\TDM-GCC-64\\bin",
-		"C:\\msys64\\mingw64\\bin",
-		"C:\\msys64\\ucrt64\\bin",
-		"C:\\Program Files\\mingw-w64\\bin",
-		"C:\\Program Files (x86)\\mingw-w64\\bin",
-	}
-
-	// Check if gcc is already in PATH
-	if _, err := exec.LookPath("gcc"); err == nil {
-		// GCC found in PATH, get its directory
-		cmd := exec.Command("where", "gcc")
-		output, err := cmd.Output()
-		if err == nil {
-			gccPath := strings.TrimSpace(strings.Split(string(output), "\n")[0])
-			return filepath.Dir(gccPath), nil
-		}
-	}
-
-	// Check common installation paths
-	for _, path := range commonPaths {
-		gccExe := filepath.Join(path, "gcc.exe")
-		if _, err := os.Stat(gccExe); err == nil {
-			return path, nil
-		}
-	}
-
-	return "", fmt.Errorf("GCC not found in common locations or PATH")
-}
-
-// setEnvVar sets or updates an environment variable in the env slice
-func setEnvVar(env []string, key, value string) []string {
-	prefix := key + "="
-	for i, e := range env {
-		if strings.HasPrefix(e, prefix) {
-			env[i] = prefix + value
-			return env
-		}
-	}
-	return append(env, prefix+value)
-}
-
-// installBinary copies the compiled binary to the installation directory
 func installBinary(sourcePath string) error {
 	targetPath := paths.GetMainAgentBinaryPath()
-
 	LogInfo("Installing binary from %s to %s", sourcePath, targetPath)
 
-	// Ensure the target directory exists
 	targetDir := filepath.Dir(targetPath)
 	if err := os.MkdirAll(targetDir, 0755); err != nil {
 		return fmt.Errorf("failed to create target directory: %w", err)
 	}
 
-	// Read source file
 	sourceData, err := os.ReadFile(sourcePath)
 	if err != nil {
 		return fmt.Errorf("failed to read source binary: %w", err)
 	}
 
-	// Write to target location
 	if err := os.WriteFile(targetPath, sourceData, 0755); err != nil {
 		return fmt.Errorf("failed to write target binary: %w", err)
 	}
 
 	LogInfo("Binary written to: %s", targetPath)
 
-	// On Unix systems, set executable permissions and ownership
 	if runtime.GOOS != "windows" {
-		// Set executable permissions (0755)
 		if err := os.Chmod(targetPath, 0755); err != nil {
 			return fmt.Errorf("failed to set executable permissions: %w", err)
 		}
 		LogInfo("Set executable permissions (0755) on: %s", targetPath)
 
-		// Set ownership to root if running as root
 		if os.Geteuid() == 0 {
 			if err := os.Chown(targetPath, 0, 0); err != nil {
 				LogWarning("Failed to set ownership to root: %v", err)
-				// Don't fail the installation for this
 			} else {
 				LogInfo("Set ownership to root:root on: %s", targetPath)
 			}
 		}
 	}
 
-	// Verify binary exists and is executable
 	fileInfo, err := os.Stat(targetPath)
 	if err != nil {
 		return fmt.Errorf("failed to verify installed binary: %w", err)
 	}
 
 	if runtime.GOOS != "windows" {
-		// Check if file has executable bit set
 		if fileInfo.Mode()&0111 == 0 {
 			return fmt.Errorf("binary is not executable")
 		}
@@ -645,7 +633,6 @@ func installBinary(sourcePath string) error {
 	return nil
 }
 
-// verifyMainAgentRunning checks if the main agent service is running
 func verifyMainAgentRunning() error {
 	const maxRetries = 3
 	const retryDelay = 2 * time.Second
@@ -681,60 +668,34 @@ func verifyMainAgentRunning() error {
 	return fmt.Errorf("service not running after %d verification attempts", maxRetries)
 }
 
-// BackupInfo stores information about a backup
 type BackupInfo struct {
 	Version    string
 	BackupPath string
+	BinaryPath string
 	Timestamp  time.Time
 }
 
-// createBackup creates a backup of the current binary before update
 func createBackup(currentVersion string) (*BackupInfo, error) {
 	LogInfo("Creating backup of current binary...")
 
 	binaryPath := paths.GetMainAgentBinaryPath()
-
-	// Check if current binary exists at system location
-	if _, err := os.Stat(binaryPath); os.IsNotExist(err) {
-		// On macOS/Linux, also check user's GOPATH/bin as fallback
-		if runtime.GOOS == "darwin" || runtime.GOOS == "linux" || runtime.GOOS == "windows" {
-			// Use platform-specific function to get possible paths
-			possiblePaths := getPossibleBinaryPaths()
-
-			// Try each possible path
-			for _, path := range possiblePaths {
-				if _, err := os.Stat(path); err == nil {
-					LogInfo("Found binary for backup at: %s", path)
-					binaryPath = path
-					break
-				}
-			}
-
-			// If still not found, return error
-			if binaryPath == paths.GetMainAgentBinaryPath() {
-				return nil, fmt.Errorf("current binary not found at %s or any user GOPATH location", binaryPath)
-			}
-		} else {
-			return nil, fmt.Errorf("current binary not found at %s", binaryPath)
-		}
-	}
-
 	backupPath := binaryPath + ".backup"
 
-	// Read current binary
+	if _, err := os.Stat(binaryPath); os.IsNotExist(err) {
+		return nil, fmt.Errorf("current binary not found at %s", binaryPath)
+	}
+
 	LogInfo("Reading current binary from: %s", binaryPath)
 	binaryData, err := os.ReadFile(binaryPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read current binary: %w", err)
 	}
 
-	// Write backup file
 	LogInfo("Writing backup to: %s", backupPath)
 	if err := os.WriteFile(backupPath, binaryData, 0755); err != nil {
 		return nil, fmt.Errorf("failed to write backup file: %w", err)
 	}
 
-	// Verify backup was created
 	backupInfo, err := os.Stat(backupPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to verify backup file: %w", err)
@@ -743,48 +704,54 @@ func createBackup(currentVersion string) (*BackupInfo, error) {
 	backup := &BackupInfo{
 		Version:    currentVersion,
 		BackupPath: backupPath,
+		BinaryPath: binaryPath,
 		Timestamp:  time.Now(),
 	}
 
 	LogInfo("Backup created successfully:")
 	LogInfo("  Version: %s", backup.Version)
 	LogInfo("  Path: %s", backup.BackupPath)
+	LogInfo("  Binary Path: %s", backup.BinaryPath)
 	LogInfo("  Size: %d bytes", backupInfo.Size())
 	LogInfo("  Timestamp: %s", backup.Timestamp.Format(time.RFC3339))
 
 	return backup, nil
 }
 
-// rollback restores the previous version from backup
 func rollback(backup *BackupInfo) error {
 	LogInfo("=== Starting rollback process ===")
 	LogInfo("Rolling back to version: %s", backup.Version)
 	LogInfo("Backup path: %s", backup.BackupPath)
 
-	// Step 1: Verify backup file exists
 	LogInfo("Step 1: Verifying backup file exists...")
 	if _, err := os.Stat(backup.BackupPath); os.IsNotExist(err) {
-		return fmt.Errorf("backup file not found at %s", backup.BackupPath)
+		LogCritical("Backup file not found at %s", backup.BackupPath)
+		return fmt.Errorf("backup file not found at %s - manual recovery required", backup.BackupPath)
 	}
 	LogInfo("Backup file verified")
 
-	// Step 2: Restore binary from backup
 	LogInfo("Step 2: Restoring binary from backup...")
-	binaryPath := paths.GetMainAgentBinaryPath()
+	binaryPath := backup.BinaryPath
+	LogInfo("Restoring to original binary path: %s", binaryPath)
 
-	// Read backup file
 	backupData, err := os.ReadFile(backup.BackupPath)
 	if err != nil {
-		return fmt.Errorf("failed to read backup file: %w", err)
+		LogCritical("Failed to read backup file: %v", err)
+		return fmt.Errorf("failed to read backup file: %w - manual recovery may be required", err)
 	}
 
-	// Write to binary location
+	targetDir := filepath.Dir(binaryPath)
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		LogCritical("Failed to create target directory: %v", err)
+		return fmt.Errorf("failed to create target directory: %w", err)
+	}
+
 	if err := os.WriteFile(binaryPath, backupData, 0755); err != nil {
-		return fmt.Errorf("failed to restore binary: %w", err)
+		LogCritical("Failed to restore binary: %v", err)
+		return fmt.Errorf("failed to restore binary: %w - manual recovery required", err)
 	}
 	LogInfo("Binary restored to: %s", binaryPath)
 
-	// On Unix systems, set proper permissions
 	if runtime.GOOS != "windows" {
 		if err := os.Chmod(binaryPath, 0755); err != nil {
 			LogWarning("Failed to set executable permissions: %v", err)
@@ -796,27 +763,46 @@ func rollback(backup *BackupInfo) error {
 		}
 	}
 
-	// Step 3: Reinstall service using service manager
 	LogInfo("Step 3: Reinstalling service...")
 	if err := serviceManager.Install(MainAgentServiceName, binaryPath); err != nil {
-		return fmt.Errorf("failed to reinstall service: %w", err)
+		LogError("Failed to reinstall service: %v", err)
+		return fmt.Errorf("failed to reinstall service: %w - manual service installation required", err)
 	}
 	LogInfo("Service reinstalled successfully")
 
-	// Step 4: Start service using service manager
 	LogInfo("Step 4: Starting service...")
 	if err := serviceManager.Start(MainAgentServiceName); err != nil {
-		return fmt.Errorf("failed to start service: %w", err)
+		LogError("Failed to start service: %v", err)
+		return fmt.Errorf("failed to start service: %w - manual service start required", err)
 	}
 	LogInfo("Service started successfully")
 
-	// Step 5: Verify service is running
 	LogInfo("Step 5: Verifying service is running...")
 	if err := verifyMainAgentRunning(); err != nil {
-		return fmt.Errorf("service not running after rollback: %w", err)
+		LogError("Service not running after rollback: %v", err)
+		return fmt.Errorf("service not running after rollback: %w - manual verification required", err)
 	}
 	LogInfo("Service verified running")
 
 	LogInfo("=== Rollback completed successfully to version %s ===", backup.Version)
+	LogInfo("Backup file preserved for manual inspection at: %s", backup.BackupPath)
+	return nil
+}
+
+func cleanupBackupFile(backupPath string) error {
+	LogInfo("Cleaning up backup file after successful update...")
+	LogInfo("Backup file path: %s", backupPath)
+
+	if _, err := os.Stat(backupPath); os.IsNotExist(err) {
+		LogWarning("Backup file not found at: %s (may have been already deleted)", backupPath)
+		return nil
+	}
+
+	if err := os.Remove(backupPath); err != nil {
+		LogError("Failed to delete backup file: %v", err)
+		return fmt.Errorf("failed to delete backup file: %w", err)
+	}
+
+	LogInfo("Backup file deleted successfully: %s", backupPath)
 	return nil
 }
