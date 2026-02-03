@@ -7,7 +7,8 @@ import (
 )
 
 // GetDataDirectory returns the platform-specific data directory
-// Linux/macOS: /var/lib/sentinelgo
+// macOS: /Library/Application Support/SentinelGo
+// Linux: /var/lib/sentinelgo
 // Windows: %ProgramData%\SentinelGo
 func GetDataDirectory() string {
 	switch runtime.GOOS {
@@ -17,7 +18,9 @@ func GetDataDirectory() string {
 			programData = "C:\\ProgramData"
 		}
 		return filepath.Join(programData, "SentinelGo")
-	case "darwin", "linux":
+	case "darwin":
+		return "/Library/Application Support/SentinelGo"
+	case "linux":
 		return "/var/lib/sentinelgo"
 	default:
 		return "/var/lib/sentinelgo"
