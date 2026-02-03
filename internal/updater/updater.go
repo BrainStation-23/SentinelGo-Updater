@@ -106,10 +106,18 @@ func getInstalledVersion() (string, error) {
 				possiblePaths = append(possiblePaths, filepath.Join(gopath, "bin", "sentinel"))
 			}
 
-			// Method 2: Check SUDO_USER's home directory
+			// Method 2: Check SUDO_USER's home directory (cross-platform)
 			if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
-				userHome := filepath.Join("/Users", sudoUser)
-				possiblePaths = append(possiblePaths, filepath.Join(userHome, "go", "bin", "sentinel"))
+				var userHome string
+				switch runtime.GOOS {
+				case "darwin":
+					userHome = filepath.Join("/Users", sudoUser)
+				case "linux":
+					userHome = filepath.Join("/home", sudoUser)
+				}
+				if userHome != "" {
+					possiblePaths = append(possiblePaths, filepath.Join(userHome, "go", "bin", "sentinel"))
+				}
 			}
 
 			// Method 3: Check current HOME
@@ -120,19 +128,6 @@ func getInstalledVersion() (string, error) {
 			// Method 4: Try os.UserHomeDir()
 			if homeDir, err := os.UserHomeDir(); err == nil {
 				possiblePaths = append(possiblePaths, filepath.Join(homeDir, "go", "bin", "sentinel"))
-			}
-
-			// Method 5: Common macOS user paths
-			if runtime.GOOS == "darwin" {
-				// Try to find any user's go/bin/sentinel
-				usersDir := "/Users"
-				if entries, err := os.ReadDir(usersDir); err == nil {
-					for _, entry := range entries {
-						if entry.IsDir() && entry.Name() != "Shared" && entry.Name() != "Guest" {
-							possiblePaths = append(possiblePaths, filepath.Join(usersDir, entry.Name(), "go", "bin", "sentinel"))
-						}
-					}
-				}
 			}
 
 			// Try each possible path
@@ -474,35 +469,27 @@ func downloadAndCompile(version string) (string, error) {
 			sudoUser := os.Getenv("SUDO_USER")
 			LogInfo("SUDO_USER from environment: %s", sudoUser)
 			if sudoUser != "" {
-				homeDir = filepath.Join("/Users", sudoUser)
+				// Construct home directory based on OS
+				switch runtime.GOOS {
+				case "darwin":
+					homeDir = filepath.Join("/Users", sudoUser)
+				case "linux":
+					homeDir = filepath.Join("/home", sudoUser)
+				case "windows":
+					homeDir = filepath.Join("C:\\Users", sudoUser)
+				}
 				LogInfo("Using SUDO_USER home directory: %s", homeDir)
 			} else {
-				// Try to find any user's home directory on macOS
-				if runtime.GOOS == "darwin" {
-					usersDir := "/Users"
-					if entries, err := os.ReadDir(usersDir); err == nil {
-						for _, entry := range entries {
-							if entry.IsDir() && entry.Name() != "Shared" && entry.Name() != "Guest" {
-								homeDir = filepath.Join(usersDir, entry.Name())
-								LogInfo("Using first available user home directory: %s", homeDir)
-								break
-							}
-						}
-					}
-				}
-
-				// Last resort: try os.UserHomeDir()
-				if homeDir == "" {
-					var err error
-					homeDir, err = os.UserHomeDir()
-					if err != nil {
-						LogError("Failed to get home directory: %v", err)
-						// Use a fallback path
-						homeDir = "/tmp"
-						LogWarning("Using fallback directory: %s", homeDir)
-					} else {
-						LogInfo("Using home directory from os.UserHomeDir: %s", homeDir)
-					}
+				// Try os.UserHomeDir()
+				var err error
+				homeDir, err = os.UserHomeDir()
+				if err != nil {
+					LogWarning("Failed to get home directory: %v", err)
+					// Use temp directory as fallback
+					homeDir = os.TempDir()
+					LogWarning("Using fallback directory: %s", homeDir)
+				} else {
+					LogInfo("Using home directory from os.UserHomeDir: %s", homeDir)
 				}
 			}
 		} else {
@@ -778,8 +765,16 @@ func createBackup(currentVersion string) (*BackupInfo, error) {
 			}
 
 			if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
-				userHome := filepath.Join("/Users", sudoUser)
-				possiblePaths = append(possiblePaths, filepath.Join(userHome, "go", "bin", "sentinel"))
+				var userHome string
+				switch runtime.GOOS {
+				case "darwin":
+					userHome = filepath.Join("/Users", sudoUser)
+				case "linux":
+					userHome = filepath.Join("/home", sudoUser)
+				}
+				if userHome != "" {
+					possiblePaths = append(possiblePaths, filepath.Join(userHome, "go", "bin", "sentinel"))
+				}
 			}
 
 			if home := os.Getenv("HOME"); home != "" {
@@ -788,17 +783,6 @@ func createBackup(currentVersion string) (*BackupInfo, error) {
 
 			if homeDir, err := os.UserHomeDir(); err == nil {
 				possiblePaths = append(possiblePaths, filepath.Join(homeDir, "go", "bin", "sentinel"))
-			}
-
-			if runtime.GOOS == "darwin" {
-				usersDir := "/Users"
-				if entries, err := os.ReadDir(usersDir); err == nil {
-					for _, entry := range entries {
-						if entry.IsDir() && entry.Name() != "Shared" && entry.Name() != "Guest" {
-							possiblePaths = append(possiblePaths, filepath.Join(usersDir, entry.Name(), "go", "bin", "sentinel"))
-						}
-					}
-				}
 			}
 
 			// Try each possible path
