@@ -101,12 +101,31 @@ func getInstalledVersion() (string, error) {
 			gopath := os.Getenv("GOPATH")
 			LogInfo("GOPATH from environment: %s", gopath)
 			if gopath == "" {
-				homeDir, err := os.UserHomeDir()
-				if err == nil {
+				// Try multiple methods to get home directory
+				homeDir := os.Getenv("HOME")
+				if homeDir == "" {
+					// If running as sudo, try to get the original user's home
+					if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
+						LogInfo("Running as sudo, SUDO_USER: %s", sudoUser)
+						homeDir = filepath.Join("/Users", sudoUser)
+						LogInfo("Using home directory: %s", homeDir)
+					} else {
+						// Fallback to os.UserHomeDir()
+						var err error
+						homeDir, err = os.UserHomeDir()
+						if err != nil {
+							LogError("Failed to get home directory: %v", err)
+						} else {
+							LogInfo("Got home directory from os.UserHomeDir: %s", homeDir)
+						}
+					}
+				} else {
+					LogInfo("Got home directory from HOME env: %s", homeDir)
+				}
+
+				if homeDir != "" {
 					gopath = filepath.Join(homeDir, "go")
 					LogInfo("GOPATH not set, using default: %s", gopath)
-				} else {
-					LogError("Failed to get home directory: %v", err)
 				}
 			}
 
