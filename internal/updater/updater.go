@@ -92,9 +92,37 @@ func Run() {
 func getInstalledVersion() (string, error) {
 	binaryPath := paths.GetMainAgentBinaryPath()
 
-	// Check if binary exists
+	// Check if binary exists at system location
 	if _, err := os.Stat(binaryPath); os.IsNotExist(err) {
-		return "", fmt.Errorf("main agent binary not found at %s", binaryPath)
+		// On macOS/Linux, also check user's GOPATH/bin as fallback
+		if runtime.GOOS == "darwin" || runtime.GOOS == "linux" {
+			gopath := os.Getenv("GOPATH")
+			if gopath == "" {
+				homeDir, err := os.UserHomeDir()
+				if err == nil {
+					gopath = filepath.Join(homeDir, "go")
+				}
+			}
+
+			if gopath != "" {
+				binaryName := "sentinel"
+				if runtime.GOOS == "windows" {
+					binaryName = "sentinel.exe"
+				}
+				gopathBinary := filepath.Join(gopath, "bin", binaryName)
+
+				if _, err := os.Stat(gopathBinary); err == nil {
+					LogInfo("Found binary in GOPATH: %s", gopathBinary)
+					binaryPath = gopathBinary
+				} else {
+					return "", fmt.Errorf("main agent binary not found at %s or %s", binaryPath, gopathBinary)
+				}
+			} else {
+				return "", fmt.Errorf("main agent binary not found at %s", binaryPath)
+			}
+		} else {
+			return "", fmt.Errorf("main agent binary not found at %s", binaryPath)
+		}
 	}
 
 	// Execute the binary with --version flag
@@ -621,12 +649,38 @@ func createBackup(currentVersion string) (*BackupInfo, error) {
 	LogInfo("Creating backup of current binary...")
 
 	binaryPath := paths.GetMainAgentBinaryPath()
-	backupPath := binaryPath + ".backup"
 
-	// Check if current binary exists
+	// Check if current binary exists at system location
 	if _, err := os.Stat(binaryPath); os.IsNotExist(err) {
-		return nil, fmt.Errorf("current binary not found at %s", binaryPath)
+		// On macOS/Linux, also check user's GOPATH/bin as fallback
+		if runtime.GOOS == "darwin" || runtime.GOOS == "linux" {
+			gopath := os.Getenv("GOPATH")
+			if gopath == "" {
+				homeDir, err := os.UserHomeDir()
+				if err == nil {
+					gopath = filepath.Join(homeDir, "go")
+				}
+			}
+
+			if gopath != "" {
+				binaryName := "sentinel"
+				gopathBinary := filepath.Join(gopath, "bin", binaryName)
+
+				if _, err := os.Stat(gopathBinary); err == nil {
+					LogInfo("Found binary in GOPATH for backup: %s", gopathBinary)
+					binaryPath = gopathBinary
+				} else {
+					return nil, fmt.Errorf("current binary not found at %s or %s", binaryPath, gopathBinary)
+				}
+			} else {
+				return nil, fmt.Errorf("current binary not found at %s", binaryPath)
+			}
+		} else {
+			return nil, fmt.Errorf("current binary not found at %s", binaryPath)
+		}
 	}
+
+	backupPath := binaryPath + ".backup"
 
 	// Read current binary
 	LogInfo("Reading current binary from: %s", binaryPath)
