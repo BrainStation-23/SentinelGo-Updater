@@ -91,16 +91,22 @@ func Run() {
 // getInstalledVersion reads the current main agent version
 func getInstalledVersion() (string, error) {
 	binaryPath := paths.GetMainAgentBinaryPath()
+	LogInfo("Checking for binary at system location: %s", binaryPath)
 
 	// Check if binary exists at system location
 	if _, err := os.Stat(binaryPath); os.IsNotExist(err) {
+		LogInfo("Binary not found at system location, checking GOPATH...")
 		// On macOS/Linux, also check user's GOPATH/bin as fallback
 		if runtime.GOOS == "darwin" || runtime.GOOS == "linux" {
 			gopath := os.Getenv("GOPATH")
+			LogInfo("GOPATH from environment: %s", gopath)
 			if gopath == "" {
 				homeDir, err := os.UserHomeDir()
 				if err == nil {
 					gopath = filepath.Join(homeDir, "go")
+					LogInfo("GOPATH not set, using default: %s", gopath)
+				} else {
+					LogError("Failed to get home directory: %v", err)
 				}
 			}
 
@@ -110,11 +116,13 @@ func getInstalledVersion() (string, error) {
 					binaryName = "sentinel.exe"
 				}
 				gopathBinary := filepath.Join(gopath, "bin", binaryName)
+				LogInfo("Checking GOPATH binary location: %s", gopathBinary)
 
 				if _, err := os.Stat(gopathBinary); err == nil {
 					LogInfo("Found binary in GOPATH: %s", gopathBinary)
 					binaryPath = gopathBinary
 				} else {
+					LogError("Binary not found at GOPATH location either: %v", err)
 					return "", fmt.Errorf("main agent binary not found at %s or %s", binaryPath, gopathBinary)
 				}
 			} else {
@@ -123,6 +131,8 @@ func getInstalledVersion() (string, error) {
 		} else {
 			return "", fmt.Errorf("main agent binary not found at %s", binaryPath)
 		}
+	} else {
+		LogInfo("Found binary at system location: %s", binaryPath)
 	}
 
 	// Execute the binary with --version flag
