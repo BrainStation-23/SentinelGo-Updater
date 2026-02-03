@@ -731,11 +731,27 @@ func createBackup(currentVersion string) (*BackupInfo, error) {
 	LogInfo("Creating backup of current binary...")
 
 	binaryPath := paths.GetMainAgentBinaryPath()
-	backupPath := binaryPath + ".backup"
 
+	// Check if binary exists at system location
 	if _, err := os.Stat(binaryPath); os.IsNotExist(err) {
-		return nil, fmt.Errorf("current binary not found at %s", binaryPath)
+		// If not found at system location, try platform-specific paths
+		possiblePaths := getPossibleBinaryPaths()
+		LogInfo("Binary not found at system location, checking %d possible locations...", len(possiblePaths))
+		for _, path := range possiblePaths {
+			if _, err := os.Stat(path); err == nil {
+				LogInfo("Found binary for backup at: %s", path)
+				binaryPath = path
+				break
+			}
+		}
+
+		// If still not found, return error
+		if binaryPath == paths.GetMainAgentBinaryPath() {
+			return nil, fmt.Errorf("current binary not found at %s or any fallback location", binaryPath)
+		}
 	}
+
+	backupPath := binaryPath + ".backup"
 
 	LogInfo("Reading current binary from: %s", binaryPath)
 	binaryData, err := os.ReadFile(binaryPath)
