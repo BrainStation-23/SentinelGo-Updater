@@ -17,6 +17,11 @@ func (m *windowsManager) Stop(serviceName string) error {
 	cmd := exec.Command("sc.exe", "stop", serviceName)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
+		// Check if service doesn't exist (error 1060)
+		if strings.Contains(string(output), "1060") {
+			// Service doesn't exist, nothing to stop
+			return nil
+		}
 		return fmt.Errorf("failed to stop service %s: %w, output: %s", serviceName, err, string(output))
 	}
 	return nil
@@ -27,6 +32,11 @@ func (m *windowsManager) Uninstall(serviceName string) error {
 	cmd := exec.Command("sc.exe", "delete", serviceName)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
+		// Check if service doesn't exist (error 1060)
+		if strings.Contains(string(output), "1060") {
+			// Service doesn't exist, nothing to uninstall
+			return nil
+		}
 		return fmt.Errorf("failed to delete service %s: %w, output: %s", serviceName, err, string(output))
 	}
 	return nil
@@ -35,11 +45,11 @@ func (m *windowsManager) Uninstall(serviceName string) error {
 // Install creates the service using sc.exe create
 func (m *windowsManager) Install(serviceName, binaryPath string) error {
 	// Create the service with sc.exe
-	// sc.exe create <serviceName> binPath= "<binaryPath>" start= auto
+	// Note: sc.exe requires space after = for parameters
 	cmd := exec.Command("sc.exe", "create", serviceName,
 		fmt.Sprintf("binPath= \"%s\"", binaryPath),
-		"start= auto",
-		"DisplayName= SentinelGo Agent",
+		"start=", "auto",
+		"DisplayName=", "SentinelGo Agent",
 	)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -48,8 +58,8 @@ func (m *windowsManager) Install(serviceName, binaryPath string) error {
 
 	// Configure service to restart on failure
 	cmd = exec.Command("sc.exe", "failure", serviceName,
-		"reset= 86400",
-		"actions= restart/60000/restart/60000/restart/60000",
+		"reset=", "86400",
+		"actions=", "restart/60000/restart/60000/restart/60000",
 	)
 	if err := cmd.Run(); err != nil {
 		// Log warning but don't fail installation
