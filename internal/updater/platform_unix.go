@@ -101,20 +101,19 @@ func getPossibleBinaryPaths() []string {
 		possiblePaths = append(possiblePaths, filepath.Join(gopath, "bin", "sentinel"))
 	}
 
-	// Method 2: Check SUDO_USER's home directory
-	if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
-		userHome := filepath.Join("/home", sudoUser)
-		possiblePaths = append(possiblePaths, filepath.Join(userHome, "go", "bin", "sentinel"))
-	}
-
-	// Method 3: Check current HOME
+	// Method 2: Check current HOME
 	if home := os.Getenv("HOME"); home != "" {
 		possiblePaths = append(possiblePaths, filepath.Join(home, "go", "bin", "sentinel"))
 	}
 
-	// Method 4: Try os.UserHomeDir()
+	// Method 3: Try os.UserHomeDir()
 	if homeDir, err := os.UserHomeDir(); err == nil {
 		possiblePaths = append(possiblePaths, filepath.Join(homeDir, "go", "bin", "sentinel"))
+	}
+
+	// Method 4: Try user.Current() to get home directory
+	if currentUser, err := user.Current(); err == nil && currentUser.HomeDir != "" {
+		possiblePaths = append(possiblePaths, filepath.Join(currentUser.HomeDir, "go", "bin", "sentinel"))
 	}
 
 	return possiblePaths

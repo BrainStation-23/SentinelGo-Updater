@@ -4,6 +4,7 @@
 package updater
 
 import (
+	"fmt"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -17,41 +18,20 @@ func ensureHomeDirectory() (string, error) {
 		return home, nil
 	}
 
-	// Strategy 2: Check SUDO_USER environment variable
-	if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
-		userHome := filepath.Join("/Users", sudoUser)
-		LogInfo("Home directory detected from SUDO_USER: %s", userHome)
-		return userHome, nil
-	}
-
-	// Strategy 3: Use os.UserHomeDir()
+	// Strategy 2: Use os.UserHomeDir()
 	if home, err := os.UserHomeDir(); err == nil && home != "" {
 		LogInfo("Home directory detected using os.UserHomeDir(): %s", home)
 		return home, nil
 	}
 
-	// Strategy 4: Use user.Current() to get home directory
+	// Strategy 3: Use user.Current() to get home directory
 	if currentUser, err := user.Current(); err == nil && currentUser.HomeDir != "" {
 		LogInfo("Home directory detected using user.Current(): %s", currentUser.HomeDir)
 		return currentUser.HomeDir, nil
 	}
 
-	// Strategy 5: Scan /Users directory for any user (macOS-specific fallback)
-	LogInfo("Scanning /Users directory for available users...")
-	usersDir := "/Users"
-	if entries, err := os.ReadDir(usersDir); err == nil {
-		for _, entry := range entries {
-			if entry.IsDir() && entry.Name() != "Shared" && entry.Name() != "Guest" {
-				userHome := filepath.Join(usersDir, entry.Name())
-				LogInfo("Home directory detected by scanning /Users: %s", userHome)
-				return userHome, nil
-			}
-		}
-	}
-
-	// Strategy 6: Use /tmp as absolute last resort
-	LogWarning("Could not determine home directory, using /tmp as fallback")
-	return "/tmp", nil
+	// All strategies failed
+	return "", fmt.Errorf("unable to determine home directory: all detection strategies failed")
 }
 
 // getPossibleBinaryPaths returns platform-specific possible paths for the sentinel binary

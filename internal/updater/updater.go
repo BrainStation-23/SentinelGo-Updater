@@ -77,6 +77,15 @@ func Run() {
 	LogInfo("Check interval: %v", CheckInterval)
 	LogInfo("Main agent module: %s", MainAgentModule)
 
+	// Set up environment variables at startup
+	LogInfo("Setting up environment variables...")
+	if err := setEnvironmentVariables(); err != nil {
+		LogError("Failed to set up environment variables: %v", err)
+		LogWarning("Continuing anyway, but some operations may fail")
+	} else {
+		LogInfo("Environment variables configured successfully")
+	}
+
 	for {
 		LogInfo("--- Starting version check ---")
 
@@ -329,13 +338,6 @@ func parseVersion(version string) [3]int {
 
 func performUpdate(targetVersion string) error {
 	LogInfo("=== Starting update to %s ===", targetVersion)
-
-	LogInfo("Setting up environment for update...")
-	if err := setEnvironmentVariables(); err != nil {
-		LogError("Environment setup failed: %v", err)
-		return fmt.Errorf("failed to set up environment: %w", err)
-	}
-	LogInfo("Environment setup completed successfully")
 
 	currentVersion, err := getInstalledVersion()
 	if err != nil {
