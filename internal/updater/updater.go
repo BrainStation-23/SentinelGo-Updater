@@ -465,21 +465,48 @@ func downloadAndCompile(version string) (string, error) {
 
 	// Setup Go environment variables
 	gopath := os.Getenv("GOPATH")
+	LogInfo("GOPATH from environment: %s", gopath)
 	if gopath == "" {
 		// Try multiple methods to get home directory (same as getInstalledVersion)
 		homeDir := os.Getenv("HOME")
+		LogInfo("HOME from environment: %s", homeDir)
 		if homeDir == "" {
-			if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
+			sudoUser := os.Getenv("SUDO_USER")
+			LogInfo("SUDO_USER from environment: %s", sudoUser)
+			if sudoUser != "" {
 				homeDir = filepath.Join("/Users", sudoUser)
 				LogInfo("Using SUDO_USER home directory: %s", homeDir)
 			} else {
-				var err error
-				homeDir, err = os.UserHomeDir()
-				if err != nil {
-					return "", fmt.Errorf("failed to get home directory: %w", err)
+				// Try to find any user's home directory on macOS
+				if runtime.GOOS == "darwin" {
+					usersDir := "/Users"
+					if entries, err := os.ReadDir(usersDir); err == nil {
+						for _, entry := range entries {
+							if entry.IsDir() && entry.Name() != "Shared" && entry.Name() != "Guest" {
+								homeDir = filepath.Join(usersDir, entry.Name())
+								LogInfo("Using first available user home directory: %s", homeDir)
+								break
+							}
+						}
+					}
 				}
-				LogInfo("Using home directory from os.UserHomeDir: %s", homeDir)
+
+				// Last resort: try os.UserHomeDir()
+				if homeDir == "" {
+					var err error
+					homeDir, err = os.UserHomeDir()
+					if err != nil {
+						LogError("Failed to get home directory: %v", err)
+						// Use a fallback path
+						homeDir = "/tmp"
+						LogWarning("Using fallback directory: %s", homeDir)
+					} else {
+						LogInfo("Using home directory from os.UserHomeDir: %s", homeDir)
+					}
+				}
 			}
+		} else {
+			LogInfo("Using HOME environment variable: %s", homeDir)
 		}
 		gopath = filepath.Join(homeDir, "go")
 		LogInfo("GOPATH not set, using default: %s", gopath)
