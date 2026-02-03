@@ -413,23 +413,17 @@ func cleanupOldFiles() error {
 		LogInfo("Deleted: %s", binaryPath)
 	}
 
-	// Delete backup binary (.old)
+	// Delete old backup binary (.old) - but NOT .backup as it's used for rollback
 	backupOldPath := binaryPath + ".old"
-	LogInfo("Checking for backup file: %s", backupOldPath)
+	LogInfo("Checking for old backup file: %s", backupOldPath)
 	if err := os.Remove(backupOldPath); err != nil && !os.IsNotExist(err) {
 		errors = append(errors, fmt.Sprintf("failed to delete backup %s: %v", backupOldPath, err))
 	} else if err == nil {
 		LogInfo("Deleted: %s", backupOldPath)
 	}
 
-	// Delete backup binary (.backup)
-	backupPath := binaryPath + ".backup"
-	LogInfo("Checking for backup file: %s", backupPath)
-	if err := os.Remove(backupPath); err != nil && !os.IsNotExist(err) {
-		errors = append(errors, fmt.Sprintf("failed to delete backup %s: %v", backupPath, err))
-	} else if err == nil {
-		LogInfo("Deleted: %s", backupPath)
-	}
+	// NOTE: We do NOT delete .backup file here as it's needed for rollback
+	// It will be cleaned up after successful update in the defer function
 
 	// Verify database is preserved
 	dbPath := paths.GetDatabasePath()
@@ -472,9 +466,20 @@ func downloadAndCompile(version string) (string, error) {
 	// Setup Go environment variables
 	gopath := os.Getenv("GOPATH")
 	if gopath == "" {
-		homeDir, err := os.UserHomeDir()
-		if err != nil {
-			return "", fmt.Errorf("failed to get home directory: %w", err)
+		// Try multiple methods to get home directory (same as getInstalledVersion)
+		homeDir := os.Getenv("HOME")
+		if homeDir == "" {
+			if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
+				homeDir = filepath.Join("/Users", sudoUser)
+				LogInfo("Using SUDO_USER home directory: %s", homeDir)
+			} else {
+				var err error
+				homeDir, err = os.UserHomeDir()
+				if err != nil {
+					return "", fmt.Errorf("failed to get home directory: %w", err)
+				}
+				LogInfo("Using home directory from os.UserHomeDir: %s", homeDir)
+			}
 		}
 		gopath = filepath.Join(homeDir, "go")
 		LogInfo("GOPATH not set, using default: %s", gopath)
