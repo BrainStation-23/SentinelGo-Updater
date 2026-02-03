@@ -602,6 +602,37 @@ func downloadAndCompile(version string) (string, error) {
 	LogInfo("  GOCACHE=%s", gocache)
 	LogInfo("  GOMODCACHE=%s", gomodcache)
 
+	// On Windows, ensure GCC is available
+	if runtime.GOOS == "windows" {
+		LogInfo("Windows platform detected, checking for GCC...")
+		if _, err := exec.LookPath("gcc"); err != nil {
+			LogWarning("GCC not found in PATH, attempting to locate...")
+
+			// Try to find GCC in common locations
+			gccPath := findGCCOnWindows()
+			if gccPath != "" {
+				LogInfo("Found GCC at: %s", gccPath)
+				// Add to PATH for this process
+				currentPath := os.Getenv("PATH")
+				newPath := gccPath + string(os.PathListSeparator) + currentPath
+				env = setEnvVar(env, "PATH", newPath)
+				LogInfo("Added GCC to PATH for compilation")
+			} else {
+				LogError("GCC not found in PATH or common locations")
+				LogError("CGO compilation requires GCC on Windows")
+				LogError("")
+				LogError("INSTALLATION REQUIRED:")
+				LogError("  Install GCC using: winget install BrechtSanders.WinLibs.POSIX.UCRT")
+				LogError("  Or download from: https://winlibs.com/")
+				LogError("")
+				LogError("After installing GCC, the updater will automatically detect it on the next update check")
+				return "", fmt.Errorf("GCC not found - please install GCC and retry")
+			}
+		} else {
+			LogInfo("GCC found in PATH")
+		}
+	}
+
 	moduleWithVersion := fmt.Sprintf("%s/cmd/sentinel@%s", MainAgentModule, version)
 	LogInfo("Executing: %s install %s", goBinary, moduleWithVersion)
 
@@ -832,6 +863,24 @@ func rollback(backup *BackupInfo) error {
 	}
 
 	LogInfo("Step 3: Reinstalling service...")
+	// For rollback, always use the system binary path, not the user GOPATH location
+	systemBinaryPath := paths.GetMainAgentBinaryPath()
+
+	// If we restored to a user location, copy it to the system location
+	if binaryPath != systemBinaryPath {
+		LogInfo("Copying binary from %s to system location %s", binaryPath, systemBinaryPath)
+		if err := os.MkdirAll(filepath.Dir(systemBinaryPath), 0755); err != nil {
+			LogError("Failed to create system binary directory: %v", err)
+			return fmt.Errorf("failed to create system binary directory: %w", err)
+		}
+		if err := os.WriteFile(systemBinaryPath, backupData, 0755); err != nil {
+			LogError("Failed to copy binary to system location: %v", err)
+			return fmt.Errorf("failed to copy binary to system location: %w", err)
+		}
+		LogInfo("Binary copied to system location: %s", systemBinaryPath)
+		binaryPath = systemBinaryPath
+	}
+
 	if err := serviceManager.Install(MainAgentServiceName, binaryPath); err != nil {
 		LogError("Failed to reinstall service: %v", err)
 		return fmt.Errorf("failed to reinstall service: %w - manual service installation required", err)
@@ -873,4 +922,66 @@ func cleanupBackupFile(backupPath string) error {
 
 	LogInfo("Backup file deleted successfully: %s", backupPath)
 	return nil
+}
+
+// findGCCOnWindows searches for GCC in common Windows installation locations
+func findGCCOnWindows() string {
+	LogInfo("Searching for GCC in common Windows installation directories...")
+
+	// Common GCC installation paths on Windows
+	commonPaths := []string{
+		"C:\\Program Files\\WinLibs\\mingw64\\bin",
+		"C:\\Program Files\\WinLibs\\mingw32\\bin",
+		"C:\\Program Files (x86)\\WinLibs\\mingw64\\bin",
+		"C:\\Program Files (x86)\\WinLibs\\mingw32\\bin",
+		"C:\\MinGW\\bin",
+		"C:\\MinGW64\\bin",
+		"C:\\mingw64\\bin",
+		"C:\\mingw32\\bin",
+		"C:\\TDM-GCC-64\\bin",
+		"C:\\TDM-GCC-32\\bin",
+		"C:\\msys64\\mingw64\\bin",
+		"C:\\msys64\\mingw32\\bin",
+		"C:\\msys64\\ucrt64\\bin",
+	}
+
+	// Also check user-specific WinGet installation paths
+	if userProfile := os.Getenv("USERPROFILE"); userProfile != "" {
+		wingetPath := filepath.Join(userProfile, "AppData", "Local", "Microsoft", "WinGet", "Packages")
+		if entries, err := os.ReadDir(wingetPath); err == nil {
+			for _, entry := range entries {
+				if entry.IsDir() && strings.Contains(entry.Name(), "WinLibs") {
+					possiblePaths := []string{
+						filepath.Join(wingetPath, entry.Name(), "mingw64", "bin"),
+						filepath.Join(wingetPath, entry.Name(), "mingw32", "bin"),
+					}
+					commonPaths = append(commonPaths, possiblePaths...)
+				}
+			}
+		}
+	}
+
+	// Check each path for gcc.exe
+	for _, path := range commonPaths {
+		gccExe := filepath.Join(path, "gcc.exe")
+		if _, err := os.Stat(gccExe); err == nil {
+			LogInfo("Found gcc.exe at: %s", path)
+			return path
+		}
+	}
+
+	LogInfo("GCC not found in any common installation directory")
+	return ""
+}
+
+// setEnvVar sets or updates an environment variable in the env slice
+func setEnvVar(env []string, key, value string) []string {
+	prefix := key + "="
+	for i, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			env[i] = prefix + value
+			return env
+		}
+	}
+	return append(env, prefix+value)
 }
