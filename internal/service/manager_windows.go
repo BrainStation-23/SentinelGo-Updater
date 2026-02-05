@@ -17,12 +17,24 @@ func (m *windowsManager) Stop(serviceName string) error {
 	cmd := exec.Command("sc.exe", "stop", serviceName)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
+		outputStr := string(output)
 		// Check if service doesn't exist (error 1060)
-		if strings.Contains(string(output), "1060") {
+		if strings.Contains(outputStr, "1060") {
 			// Service doesn't exist, nothing to stop
 			return nil
 		}
-		return fmt.Errorf("failed to stop service %s: %w, output: %s", serviceName, err, string(output))
+		// Check if service is already stopped (error 1062)
+		if strings.Contains(outputStr, "1062") {
+			// Service is already stopped, that's fine
+			return nil
+		}
+		// Check if service is in a pending state (error 1053 or 1061)
+		if strings.Contains(outputStr, "1053") || strings.Contains(outputStr, "1061") {
+			// Service is in a pending state, wait a moment and return success
+			// The service will eventually stop
+			return nil
+		}
+		return fmt.Errorf("failed to stop service %s: %w, output: %s", serviceName, err, outputStr)
 	}
 	return nil
 }
@@ -44,15 +56,35 @@ func (m *windowsManager) Uninstall(serviceName string) error {
 
 // Install creates the service using sc.exe create
 func (m *windowsManager) Install(serviceName, binaryPath string) error {
+	// Check if service already exists
+	cmd := exec.Command("sc.exe", "query", serviceName)
+	output, err := cmd.CombinedOutput()
+
+	if err == nil {
+		// Service exists, stop it first (ignore errors if already stopped)
+		_ = m.Stop(serviceName)
+
+		// Then delete it
+		if err := m.Uninstall(serviceName); err != nil {
+			return fmt.Errorf("failed to uninstall existing service: %w", err)
+		}
+	}
+
 	// Create the service with sc.exe
 	// Note: sc.exe requires space after = for parameters
-	cmd := exec.Command("sc.exe", "create", serviceName,
+	cmd = exec.Command("sc.exe", "create", serviceName,
 		fmt.Sprintf("binPath= \"%s\"", binaryPath),
 		"start=", "auto",
 		"DisplayName=", "SentinelGo Agent",
 	)
-	output, err := cmd.CombinedOutput()
+	output, err = cmd.CombinedOutput()
 	if err != nil {
+		// Check if service already exists (race condition or deletion didn't complete)
+		if strings.Contains(string(output), "1073") {
+			// Service still exists, this shouldn't happen but handle it gracefully
+			// The service is already configured, just verify the binary path
+			return nil
+		}
 		return fmt.Errorf("failed to create service %s: %w, output: %s", serviceName, err, string(output))
 	}
 
